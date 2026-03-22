@@ -1,0 +1,553 @@
+---
+description: Error handling - use normalizeError from @cbs/shared for all errors; useMutation/useQuery with meta flags (suppressToast, showToastOnError, throwOnError); no parseServerError or error.response?.data in components; Toast and ErrorBoundary patterns.
+alwaysApply: false
+globs:
+  - '**/{src,lib}/**/*.{vue,ts}'
+  - '!**/*.spec.ts'
+---
+
+# 📖 Архитектурный стандарт: Система обработки ошибок (CBS)
+
+Этот документ описывает эталонный подход к перехвату, нормализации и отображению ошибок в нашем монорепозитории. Мы используем парадигму **«Централизованный захват, унифицированный маппинг, декларативное отображение»**.
+
+## 1. Фундаментальные принципы
+
+1. **Единый источник истины:** Любая ошибка в системе (от бэкенда, от Zod, или системный краш) перед отображением в UI **всегда** преобразуется в стандартный класс `AppError` через утилиту `normalizeError`.
+
+2. **Никакого ручного парсинга:** Компоненты никогда не копаются в `error.response?.data`.
+
+3. **Автоматизация вместо бойлерплейта:** Мы больше не пишем ручные `try/catch` и вызовы `ToastService` для каждой мутации. Этим управляет глобальный кэш TanStack Query.
+
+4. **Контекст важнее HTTP-кода:** Мы показываем UI в зависимости от того, _что делал пользователь_, а не от того, какой статус (400 или 500) вернул сервер.
+
+5. **Toast:** типы уведомлений, таймауты (ошибка по умолчанию без автозакрытия), дедупликация — см. отдельный стандарт **`toast.mdc`**.
+
+---
+
+## 2. Глобальная фабрика: `normalizeError`
+
+В пакете `@cbs/shared` находится единственная разрешенная функция для парсинга ошибок — `normalizeError(error: unknown)`.
+
+Она заменяет собой весь устаревший зоопарк утилит (`parseServerError`, `extractErrorMessage`, `extractErrorsMessage`).
+
+**Как использовать, если нужен текст или код ошибки:**
+
+```typescript
+import { normalizeError } from '@cbs/shared/lib/errors/normalizeError'
+
+const appError = normalizeError(error)
+
+console.log(appError.message) // Всегда безопасная и читаемая строка
+console.log(appError.code) // Например: HTTP_404, TIMEOUT, SCHEMA_MISMATCH
+```
+
+### Обработка ZodError в normalizeError
+
+`ZodError` — это отдельный класс ошибок, который возникает при несоответствии ответа Zod-схеме. Формально это **нарушение контракта данных на стороне источника или интеграции** — чаще всего баг бэкенда, но источником может быть BFF, gateway, legacy proxy, mock или feature flag payload. `normalizeError` **обязан** обрабатывать его явно.
+
+**Правила обработки `ZodError`:**
+
+- DEV-лог с деталями пишется **только внутри `normalizeError`** — не в API-функциях и не в хуках.
+- API-функция только вызывает `safeParse` и бросает `result.error` — без логирования.
+- Пользователю показывается нейтральное сообщение, не техническое.
+- Retry при `SCHEMA_MISMATCH` **отключаем по умолчанию** — повтор запроса чаще всего вернёт те же данные и вводит пользователя в заблуждение. Исключение возможно при плавающем баге, балансировщике с разными версиями бэкенда или race condition — в таких случаях retry допустим, но должен быть явно обоснован.
+
+```typescript
+// packages/shared/lib/errors/normalizeError.ts
+
+import { ZodError } from 'zod'
+
+export const normalizeError = (error: unknown): AppError => {
+  // ✅ ZodError — отдельный кейс, обрабатывается централизованно
+  if (error instanceof ZodError) {
+    if (import.meta.env.DEV) {
+      // Подробности для разработчика — только в DEV, только здесь
+      console.error(
+        '[SCHEMA_MISMATCH] Ответ сервера не соответствует схеме:\n',
+        z.prettifyError(error),
+      )
+    }
+    // PROD: отправить в систему мониторинга (Sentry / DataDog / etc.)
+    // monitoring.captureException(error, { tags: { code: 'SCHEMA_MISMATCH' } })
+    return new AppError({
+      code: 'SCHEMA_MISMATCH',
+      message: 'Получены неожиданные данные от сервера. Обратитесь в поддержку.',
+    })
+  }
+
+  // ... остальные кейсы: HTTP_404, HTTP_422, TIMEOUT и т.д.
+}
+```
+
+**API-функция — только парсинг и throw, без логирования:**
+
+```typescript
+// ✅ Правильно — вся логика обработки в normalizeError
+export const fetchStaffAuth = async (): Promise<StaffAuth> => {
+  const raw = await api.get('/auth/me')
+  const result = StaffAuthApiSchema.safeParse(raw)
+
+  if (!result.success) throw result.error // ← и всё, normalizeError сделает остальное
+  return result.data
+}
+
+// ❌ Неправильно — логирование в API-функции, бойлерплейт в каждом файле
+export const fetchStaffAuth = async (): Promise<StaffAuth> => {
+  const raw = await api.get('/auth/me')
+  const result = StaffAuthApiSchema.safeParse(raw)
+
+  if (!result.success) {
+    if (import.meta.env.DEV) {
+      console.error('[StaffAuth] Schema mismatch:', z.prettifyError(result.error))
+    }
+    throw result.error
+  }
+  return result.data
+}
+```
+
+---
+
+## 3. Матрица принятия решений (Как показывать ошибки)
+
+Выбор UI зависит от типа выполняемой операции.
+
+> **Правило взаимоисключения флагов:** для одного `useQuery` выбирается **один** primary UI-path. `throwOnError: true` и `meta: { showToastOnError: true }` не комбинируются на одном запросе — иначе пользователь одновременно получит и ErrorBoundary, и Toast. Toast допустим как дополнительный сигнал только при `throwOnError: false`.
+
+| Тип операции           | Инструмент  | Контекст                              | Какой UI показываем         | Автоматизация                      |
+| :--------------------- | :---------- | :------------------------------------ | :-------------------------- | :--------------------------------- |
+| Мутация (POST/PUT)     | useMutation | Действие пользователя (кнопка, форма) | Toast (всплывашка)          | ✅ Включено по умолчанию           |
+| GET (Локальный)        | useQuery    | Доп. виджет, сайдбар, список          | InlineError                 | ✅ Включено по умолчанию           |
+| GET (Критичный)        | useQuery    | Основные данные страницы              | ErrorPage (Full screen)     | Требует `throwOnError: true`       |
+| ZodError (некритичный) | useQuery    | Данные пришли, но контракт нарушен    | Toast + fallback `'—'` в UI | `meta: { showToastOnError: true }` |
+| ZodError (критичный)   | useQuery    | Данные критичны для работы экрана     | ErrorBoundary               | `throwOnError: true`               |
+| Рантайм краш           | Vue Core    | Баг во фронтенд-коде (TypeError)      | Global Boundary             | ✅ Включено по умолчанию           |
+
+---
+
+## 4. Практические сценарии (Edge Cases)
+
+### Сценарий 1: Стандартная отправка формы (Мутация)
+
+**Рекомендуемые действия:** Необходимо использовать `useMutation`. Глобальный кэш автоматически поймает ошибку, прогонит через `normalizeError` и покажет Toast.
+
+**✅ Правильно:**
+
+```typescript
+const { mutate } = useMutation({
+  mutationFn: data => api.post('/orders', data),
+  onSuccess: () => router.push('/success'),
+  // onError писать НЕ НУЖНО!
+})
+```
+
+### Сценарий 2: «Тихая» мутация (Тост не нужен)
+
+**Контекст:** Фоновое автосохранение черновика. Если оно упадет, мы не хотим пугать пользователя красным тостом.
+
+**Рекомендуемые действия:** Необходимо передать флаг `suppressToast: true` в объект `meta`.
+
+**✅ Правильно:**
+
+```typescript
+const { mutate } = useMutation({
+  mutationFn: saveDraft,
+  meta: { suppressToast: true }, // Глобальный кэш проигнорирует эту ошибку
+})
+```
+
+### Сценарий 3: Кастомный текст тоста (Переопределение)
+
+**Контекст:** Бэкенд возвращает общую ошибку, но требуется показать специфичный для этого экрана текст (например, «Этот email уже занят»).
+
+**Рекомендуемые действия:** Необходимо отключить глобальный тост (`suppressToast: true`) и написать свой локальный `onError`.
+
+**✅ Правильно:**
+
+```typescript
+import { ToastService } from '@cbs/shared/ui'
+import { normalizeError } from '@cbs/shared/lib/errors/normalizeError'
+
+const { mutate } = useMutation({
+  mutationFn: registerUser,
+  meta: { suppressToast: true }, // 1. Выключаем автоматический тост
+  onError: error => {
+    // 2. Обрабатываем вручную
+    const appError = normalizeError(error)
+    if (appError.code === 'HTTP_409') {
+      ToastService.showError('Пользователь с таким email уже существует.')
+    } else {
+      ToastService.showError(appError.message) // Фолбэк на текст от API
+    }
+  },
+})
+```
+
+### Сценарий 4: Загрузка некритичного виджета (GET)
+
+**Контекст:** Загрузка истории платежей сбоку от основного заказа. Если упадет — страница должна работать.
+
+**Рекомендуемые действия:** Необходимо использовать `useQuery` и флаг `isError` в шаблоне. Тосты не покажутся (они отключены для GET по умолчанию).
+
+**✅ Правильно:**
+
+```vue
+<template>
+  <InlineError v-if="isError" @retry="refetch" />
+  <PaymentHistory v-else :data="data" />
+</template>
+```
+
+### Сценарий 5: «Громкий» фоновый запрос (GET)
+
+**Контекст:** Периодический поллинг уведомлений. Если он отвалился из-за сети, мы хотим показать тост.
+
+**Рекомендуемые действия:** Необходимо явно запросить у глобального кэша показ тоста через `showToastOnError: true`.
+
+**✅ Правильно:**
+
+```typescript
+const { data } = useQuery({
+  queryKey: ['notifications'],
+  queryFn: fetchNotifications,
+  meta: { showToastOnError: true }, // Разрешаем тост для GET-запроса
+})
+```
+
+### Сценарий 6: Фатальная ошибка загрузки страницы (GET)
+
+**Контекст:** Открываем страницу `/orders/123`, а заказа не существует (404) или сервер лежит (500).
+
+**Рекомендуемые действия:** Необходимо передать `throwOnError: true`. Ошибка сломает текущий компонент, всплывет наверх и будет перехвачена ближайшим `<ErrorBoundary>`.
+
+**✅ Правильно:**
+
+```typescript
+const { data } = useQuery({
+  queryKey: ['order', id],
+  queryFn: () => fetchOrder(id),
+  throwOnError: true, // Делегируем ошибку на уровень ErrorBoundary (Page Level)
+})
+```
+
+### Сценарий 7: Возврат `isError` из хука
+
+`isError` возвращается из хука только если компонент, который его использует, должен рендерить `<InlineError>` или альтернативный UI при ошибке.
+
+**✅ Правильно — компонент рендерит InlineError:**
+
+```typescript
+const { data, isError, refetch } = useGetOrderByIdQuery(orderId)
+```
+
+```vue
+<InlineError v-if="isError" @retry="refetch" />
+<OrderCard v-else :order="data" />
+```
+
+**❌ Избыточно — компонент не использует isError:**
+
+```typescript
+const { data, isError } = useGetProductsQuery()
+// isError нигде в шаблоне не встречается
+```
+
+**Правило:** Хук возвращает ровно столько состояний сколько потребляет компонент. Глобальный кэш сам обработает ошибку — не нужно возвращать `isError` «на всякий случай».
+
+### Сценарий 8: ZodError — ответ сервера не соответствует схеме
+
+**Контекст:** Бэкенд вернул данные, но нарушил контракт (например, `first_name: null` вместо `string`). Zod-схема строгая, без `.nullable()`. Данные некритичны — пользователь работает, приложение не должно падать.
+
+**Ключевое отличие от сетевой ошибки:** retry бессмысленен — повтор запроса вернёт те же данные. Показывать кнопку «Повторить» значит вводить пользователя в заблуждение.
+
+**Рекомендуемые действия:**
+
+1. Схема остаётся **строгой** — не добавлять `.nullable()` ради сокрытия нарушения контракта.
+2. API-функция вызывает `safeParse` и бросает `result.error` — без дополнительного кода.
+3. `normalizeError` централизованно логирует детали в DEV, репортит в мониторинг в PROD и возвращает `SCHEMA_MISMATCH`.
+4. Хук настраивается через `meta: { showToastOnError: true }` — пользователь видит нейтральный тост.
+5. Компонент выбирает стратегию деградации в зависимости от того, есть ли частично пригодные данные:
+
+**Field-level degradation** — часть данных есть, показываем fallback для сломанного поля:
+
+```vue
+<!-- Пришли данные, но first_name: null — показываем '—' для поля, не ломаем блок -->
+<template>
+  <span>{{ user?.firstName ?? '—' }}</span>
+  <span>{{ user?.lastName ?? '' }}</span>
+</template>
+```
+
+**Widget-level degradation** — данных нет или они непригодны целиком — показываем InlineError:
+
+```vue
+<!-- Весь блок сломан — показываем InlineError, retry намеренно отсутствует -->
+<template>
+  <InlineError v-if="isError" />
+  <!-- без @retry — нарушение контракта, повтор не поможет -->
+  <UserCard v-else :user="user" />
+</template>
+```
+
+Критерий выбора: если хотя бы часть данных компонента пригодна для отображения — field-level. Если данные нужны целиком и без них компонент бессмысленен — widget-level.
+
+**✅ Правильно:**
+
+```typescript
+// API-функция — только safeParse и throw
+export const fetchStaffAuth = async (): Promise<StaffAuth> => {
+  const raw = await api.get('/auth/me')
+  const result = StaffAuthApiSchema.safeParse(raw)
+
+  if (!result.success) throw result.error
+  return result.data
+}
+
+// Хук — некритичные данные, toast вместо ErrorBoundary
+export const useGetStaffAuthQuery = () =>
+  useQuery<StaffAuth, Error>({
+    queryKey: staffQueryKeys.auth(),
+    queryFn: fetchStaffAuth,
+    throwOnError: false,
+    meta: { showToastOnError: true }, // нейтральный тост для пользователя
+  })
+```
+
+```vue
+<!-- Компонент — fallback вместо краша, без кнопки retry -->
+<template>
+  <span>{{ user?.firstName ?? '—' }}</span>
+  <span>{{ user?.lastName ?? '' }}</span>
+</template>
+```
+
+**Если данные критичны** (без них экран бессмысленен):
+
+```typescript
+// Хук — критичные данные, ErrorBoundary без retry
+export const useGetCriticalDataQuery = () =>
+  useQuery<CriticalData, Error>({
+    queryKey: criticalQueryKeys.data(),
+    queryFn: fetchCriticalData,
+    throwOnError: true, // → ErrorBoundary, retry не предлагаем
+  })
+```
+
+**Итоговая матрица для ZodError:**
+
+| Данные критичны? | `throwOnError`                     | UI                          | Retry            |
+| :--------------- | :--------------------------------- | :-------------------------- | :--------------- |
+| Нет              | `false` + `showToastOnError: true` | Fallback `'—'` в компоненте | ❌ Не показываем |
+| Да               | `true`                             | ErrorBoundary               | ❌ Не показываем |
+
+---
+
+## 5. Табу и антипаттерны (Strict Rules)
+
+- 🚫 **Запрещено** импортировать `parseServerError`, `extractErrorMessage` и `extractErrorsMessage`. Они помечены как `@deprecated`.
+
+- 🚫 **Запрещено** использовать `useErrorHandling`. Этот composable устарел и выведен из эксплуатации.
+
+- 🚫 **Запрещено** писать `error.response?.data?.message` в компонентах. Вся распаковка данных бэкенда живет строго внутри `normalizeError`.
+
+- 🚫 **Запрещено** дублировать тосты. Необходимо не писать `ToastService.showError` в `onError` мутации без предварительной передачи `meta: { suppressToast: true }`. Иначе пользователь увидит два тоста подряд.
+
+- 🚫 **Запрещено** логировать `ZodError` в API-функциях. DEV-лог живёт только внутри `normalizeError` — это единственная точка где система знает о деталях ошибки парсинга.
+
+- 🚫 **Запрещено** добавлять `.nullable()` / `.nullish()` в схему ради замалчивания бага бэкенда. Схема отражает **контракт**, а не фактическое поведение сломанного API.
+
+- 🚫 **Запрещено по умолчанию** показывать кнопку «Повторить» при `SCHEMA_MISMATCH`. Нарушение контракта данных чаще всего не решается повтором запроса и вводит пользователя в заблуждение. Исключение — плавающий баг или балансировщик с разными версиями: в таком случае retry допустим с явным обоснованием на ревью.
+
+---
+
+## 6. Пайплайн обработки ошибок парсинга: Zod → TanStack Query → UI
+
+Этот раздел описывает **полный путь ошибки** от момента несоответствия схеме до реакции интерфейса. Все три инструмента (Zod, TanStack Query, `normalizeError`) работают в связке — каждый отвечает за свой уровень.
+
+`ZodError` означает **нарушение контракта данных на стороне источника или интеграции** — чаще всего баг бэкенда, но источником может быть BFF, gateway, legacy proxy, mock или feature flag payload.
+
+### Визуальная схема пайплайна
+
+```
+Ответ сервера (raw)
+        │
+        ▼
+┌───────────────────┐
+│  safeParse(raw)   │  ← Zod-схема (строгая, без .nullable() ради бага)
+└───────────────────┘
+        │
+   result.success?
+        │
+   ДА  │  НЕТ
+        │    │
+        │    ▼
+        │  throw result.error  ← API-функция, только это, без логирования
+        │    │
+        │    ▼
+        │  queryFn падает
+        │    │
+        │    ▼
+        │  TanStack Query ловит ошибку
+        │    │
+        │    ▼
+        │  глобальный onError QueryClient
+        │    │
+        │    ▼
+        │  normalizeError(error)
+        │    ├── error instanceof ZodError?
+        │    │     ├── DEV: console.error + z.prettifyError  ← только здесь
+        │    │     └── return AppError { code: 'SCHEMA_MISMATCH' }
+        │    └── ... другие кейсы
+        │    │
+        │    ▼
+        │  AppError { code, message }
+        │    │
+        │    ▼
+        │  meta-флаги хука определяют UI-реакцию:
+        │    ├── throwOnError: true  → ErrorBoundary
+        │    ├── showToastOnError: true  → Toast (нейтральный текст)
+        │    └── (ничего)  → isError в компоненте → InlineError или fallback
+        │
+        ▼
+   result.data → transform() → типизированный объект приложения
+```
+
+---
+
+### Ответственность каждого слоя
+
+| Слой                   | Файл                | Отвечает за                                    | Не отвечает за                |
+| :--------------------- | :------------------ | :--------------------------------------------- | :---------------------------- |
+| **Zod-схема**          | `*.schema.ts`       | Описание контракта, трансформация              | Обработку ошибок, логирование |
+| **API-функция**        | `*.api.ts`          | `safeParse` + `throw result.error`             | Логирование, UI-решения       |
+| **`normalizeError`**   | `shared/lib/errors` | DEV-лог, PROD-мониторинг, маппинг в `AppError` | UI-реакцию, повторные запросы |
+| **Хук TanStack Query** | `use*Query.ts`      | `meta`-флаги, `throwOnError`                   | Детали ошибки, логирование    |
+| **Компонент / виджет** | `*.vue`             | Fallback UI, `isError` → InlineError           | Парсинг ошибки, логирование   |
+
+---
+
+### Эталонная реализация пайплайна
+
+**Шаг 1 — Zod-схема (строгая):**
+
+```typescript
+// packages/entities/staff/model/staff.schema.ts
+export const StaffAuthApiSchema = z
+  .object({
+    id: z.number(),
+    first_name: z.string(), // ← строго, не .nullable()
+    last_name: z.string().nullable(),
+  })
+  .transform(data => ({
+    id: data.id,
+    firstName: data.first_name,
+    lastName: data.last_name ?? null,
+  }))
+
+export type StaffAuth = z.infer<typeof StaffAuthApiSchema>
+```
+
+**Шаг 2 — API-функция (только парсинг и throw):**
+
+```typescript
+// packages/entities/staff/api/staff.api.ts
+export const fetchStaffAuth = async (): Promise<StaffAuth> => {
+  const raw = await api.get('/auth/me')
+  const result = StaffAuthApiSchema.safeParse(raw)
+
+  if (!result.success) throw result.error // ← и всё
+  return result.data
+}
+```
+
+**Шаг 3 — `normalizeError` (DEV-лог + PROD-мониторинг + маппинг):**
+
+```typescript
+// packages/shared/lib/errors/normalizeError.ts
+import { ZodError, prettifyError } from 'zod'
+
+export const normalizeError = (error: unknown): AppError => {
+  if (error instanceof ZodError) {
+    if (import.meta.env.DEV) {
+      console.error('[SCHEMA_MISMATCH] Нарушение контракта данных:\n', prettifyError(error))
+    }
+    // PROD: отправить в систему мониторинга
+    // monitoring.captureException(error, { tags: { code: 'SCHEMA_MISMATCH' } })
+    return new AppError({
+      code: 'SCHEMA_MISMATCH',
+      message: 'Получены неожиданные данные от сервера. Обратитесь в поддержку.',
+    })
+  }
+  // ... HTTP_404, HTTP_422, TIMEOUT
+}
+```
+
+**Шаг 4 — хук (meta-флаги определяют UI-реакцию):**
+
+> **Примечание по типизации:** хук объявляется как `useQuery<StaffAuth, Error>` — TanStack Query получает сырой `Error | unknown` от `queryFn`. Нормализация в `AppError` происходит в глобальном `onError` QueryClient, а не в самом хуке. В компоненте или при обращении к `query.error` тип будет `Error`, а не `AppError` — используй `normalizeError(query.error)` если нужен доступ к `appError.code`.
+
+```typescript
+// packages/entities/staff/api/useGetStaffAuthQuery.ts
+
+// Вариант А: данные некритичны → toast + fallback в компоненте
+// throwOnError: false и showToastOnError: true не конфликтуют — toast это побочный сигнал
+export const useGetStaffAuthQuery = () =>
+  useQuery<StaffAuth, Error>({
+    queryKey: staffQueryKeys.auth(),
+    queryFn: fetchStaffAuth,
+    throwOnError: false,
+    meta: { showToastOnError: true },
+  })
+
+// Вариант Б: данные критичны → ErrorBoundary
+// throwOnError: true — единственный primary UI-path, showToastOnError НЕ добавляем
+export const useGetStaffAuthQuery = () =>
+  useQuery<StaffAuth, Error>({
+    queryKey: staffQueryKeys.auth(),
+    queryFn: fetchStaffAuth,
+    throwOnError: true,
+  })
+```
+
+**Шаг 5 — компонент (выбор стратегии деградации):**
+
+```vue
+<!-- Field-level: часть данных есть, показываем fallback для сломанного поля -->
+<template>
+  <span>{{ user?.firstName ?? '—' }}</span>
+  <span>{{ user?.lastName ?? '' }}</span>
+</template>
+
+<!-- Widget-level: данные непригодны целиком — InlineError, retry намеренно отсутствует -->
+<template>
+  <InlineError v-if="isError" />
+  <UserCard v-else :user="user" />
+</template>
+```
+
+---
+
+### Чеклист при добавлении нового API-запроса
+
+Перед тем как написать новый хук и API-функцию — ответить на четыре вопроса:
+
+```
+1. Схема
+   □ Поля строгие (без .nullable() ради замалчивания нарушения контракта)?
+   □ safeParse + throw result.error — без дополнительного кода?
+
+2. Хук
+   □ Данные критичны для работы экрана? → throwOnError: true (без showToastOnError)
+   □ Данные некритичны, нужен тост?     → throwOnError: false + meta: { showToastOnError: true }
+   □ Данные некритичны, тост не нужен?  → isError пробросить в компонент
+   □ throwOnError и showToastOnError не стоят вместе на одном запросе?
+
+3. Компонент
+   □ Частичные данные? → field-level: fallback '—' для сломанного поля
+   □ Данные непригодны целиком? → widget-level: InlineError без @retry
+   □ isError возвращается из хука только если компонент его потребляет?
+
+4. Production-observability
+   □ SCHEMA_MISMATCH репортится в систему мониторинга (Sentry / DataDog)?
+   □ DEV-лог через console.error есть только в normalizeError, не в API-функциях?
+```

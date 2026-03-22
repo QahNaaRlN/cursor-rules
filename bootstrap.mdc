@@ -1,0 +1,208 @@
+---
+description: 'Стандарт bootstrap: инициализация приложения, порядок подключения, правила main.ts'
+globs:
+  - 'apps/*/src/main.ts'
+  - 'apps/*/src/app/bootstrap/**/*.ts'
+---
+
+# 🚀 Стандарт Bootstrap (CBS)
+
+## 1. Философия
+
+`bootstrap` — единственное место в приложении где собирается инфраструктурная конфигурация и запускаются зависимости. `main.ts` знает только о **порядке подключения** — никакой конфигурационной логики там быть не должно.
+
+---
+
+## 2. Структура
+
+```
+src/app/bootstrap/
+  index.ts      — главная функция bootstrap(), возвращает { queryClient }
+  api.ts        — initApi(config), читает VITE_* переменные
+  query.ts      — createQueryClient с настройкой onShowError
+  config.ts     — сборка конфига для bootstrap (auth, notification колбэки)
+```
+
+---
+
+## 3. Правила `main.ts`
+
+### Обязательный порядок
+
+```typescript
+// 1. createApp
+const app = createApp(App)
+
+// 2. createPinia — ДО любого вызова useStore
+const pinia = createPinia()
+app.use(pinia)
+
+// 3. bootstrap — ПОСЛЕ pinia, принимает pinia инстанс
+const { queryClient } = bootstrap(pinia)
+
+// 4. остальные плагины
+app.use(VueQueryPlugin, { queryClient })
+app.use(router)
+
+// 5. mount — всегда последним
+app.mount('#app')
+```
+
+### Что запрещено в `main.ts`
+
+- 🚫 Вызов `useStore()` до `app.use(createPinia())` — Pinia не инициализирована
+- 🚫 Inline-конфигурация колбэков (`auth`, `notification`) — переезжает в `bootstrap/config.ts`
+- 🚫 Прямой вызов `initApi()` с `import.meta.env` — переезжает в `bootstrap/api.ts`
+- 🚫 Inline `createQueryClient({ onShowError: ... })` — переезжает в `bootstrap/query.ts`
+- 🚫 Любая бизнес-логика и условные ветвления
+
+### Эталонный `main.ts`
+
+```typescript
+import { createApp } from 'vue'
+import { createPinia } from 'pinia'
+import { VueQueryPlugin } from '@tanstack/vue-query'
+import { router } from '@/app/router'
+import { bootstrap } from '@/app/bootstrap'
+import App from './App.vue'
+
+const app = createApp(App)
+const pinia = createPinia()
+app.use(pinia)
+
+const { queryClient } = bootstrap(pinia)
+
+app.use(VueQueryPlugin, { queryClient })
+app.use(router)
+app.mount('#app')
+```
+
+---
+
+## 4. Правила файлов bootstrap
+
+### `bootstrap/index.ts`
+
+- Принимает `pinia` инстанс как аргумент
+- Вызывает все `bootstrap*` функции из соседних файлов
+- Возвращает артефакты которые нужны `main.ts` (например `queryClient`)
+- Не содержит логики — только оркестрация
+
+```typescript
+import { createPinia } from 'pinia'
+import { bootstrapApi } from './api'
+import { bootstrapQuery } from './query'
+import { createBootstrapConfig } from './config'
+import { useAuthStore } from '@cbs/entities/auth'
+
+export const bootstrap = (pinia: ReturnType<typeof createPinia>) => {
+    bootstrapApi()
+
+    const authStore = useAuthStore(pinia) // ← явная привязка к pinia инстансу
+    const queryClient = bootstrapQuery()
+
+    return { queryClient }
+}
+```
+
+### `bootstrap/api.ts`
+
+- Единственное место где разрешено читать `import.meta.env` для инфраструктурных нужд
+- Передаёт готовый конфиг в `initApi` — пакет `@cbs/api` не знает о `VITE_*`
+
+```typescript
+import { initApi } from '@cbs/api'
+
+/**
+ * Утилита, которая инициализирует Axios-инстанс с конфигурацией из переменных окружения.
+ */
+export const bootstrapApi = () => initApi({
+    baseUrl: import.meta.env.VITE_BASE_API_URL,
+    prefix: import.meta.env.VITE_API_PREFIX,
+    timeout: import.meta.env.VITE_API_TIMEOUT,
+})
+```
+
+### `bootstrap/query.ts`
+
+- Создаёт и возвращает `queryClient`
+- Подключает `ToastService` для отображения ошибок
+
+```typescript
+import { createQueryClient } from '@cbs/shared/lib'
+import { ToastService } from '@cbs/shared'
+
+/**
+ * Утилита, которая создаёт инстанс QueryClient с глобальной обработкой ошибок.
+ */
+export const bootstrapQuery = () => createQueryClient({
+    onShowError: (message: string) => ToastService.showError(message),
+})
+```
+
+### `bootstrap/config.ts`
+
+- Собирает конфигурационные колбэки для `bootstrap`
+- Принимает зависимости (store, сервисы) как аргументы — не импортирует их глобально
+
+```typescript
+import { ToastService } from '@cbs/shared'
+import type { AuthStore } from '@cbs/entities/auth'
+
+/**
+ * Утилита, которая собирает конфигурацию bootstrap из store и сервисов приложения.
+ */
+export const createBootstrapConfig = (authStore: AuthStore) => ({
+    auth: {
+        getAccessToken: () => authStore.accessToken ?? null,
+        getTokenType: () => authStore.tokenType ?? null,
+        isTokenExpired: () => authStore.isTokenExpired,
+        refreshAuth: () => authStore.refreshAuth(),
+        logout: () => authStore.logout(),
+    },
+    notification: {
+        showError: (message: string) => ToastService.showError(message),
+    },
+})
+```
+
+---
+
+## 5. Антипаттерны
+
+```typescript
+// ❌ useStore до pinia
+app.use(createPinia())
+const authStore = useAuthStore() // Pinia может не быть готова
+
+// ✅ useStore с явным pinia инстансом
+const pinia = createPinia()
+app.use(pinia)
+const authStore = useAuthStore(pinia)
+```
+
+```typescript
+// ❌ Конфигурация inline в main.ts
+bootstrap({
+    auth: {
+        getAccessToken: () => authStore.accessToken || null,
+        ...
+    },
+})
+
+// ✅ Конфигурация собирается в bootstrap/config.ts
+const { queryClient } = bootstrap(pinia)
+```
+
+```typescript
+// ❌ VITE_* читается в packages/api
+// packages/api/src/index.ts
+const api = axios.create({
+    baseURL: import.meta.env.VITE_BASE_API_URL, // пакет не должен знать о Vite
+})
+
+// ✅ VITE_* читается только в bootstrap/api.ts
+export const bootstrapApi = () => initApi({
+    baseUrl: import.meta.env.VITE_BASE_API_URL,
+})
+```

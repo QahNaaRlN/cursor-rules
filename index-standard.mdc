@@ -1,0 +1,138 @@
+---
+description: 'Стандарт индексных файлов: именованные реэкспорты, порядок блоков, JSDoc'
+globs:
+    - '**/src/**/index.ts'
+---
+
+# 📦 Стандарт индексных файлов (Public API сущности)
+
+## 1. Философия
+
+`index.ts` — это **публичный контракт сущности**. Он определяет, что доступно снаружи, и защищает внутренние детали реализации от случайного использования.
+
+- Один `index.ts` на сущность — единая точка входа.
+- Всё, чего нет в `index.ts` — приватно и не может импортироваться напрямую из других слайсов.
+- Файл не содержит логики — только реэкспорты.
+
+---
+
+## 2. Правила реэкспортов
+
+### Только именованные реэкспорты
+
+`export *` запрещён — он скрывает публичный контракт и автоматически публикует всё, что появится в файле-источнике.
+
+```ts
+// ❌ Скрывает контракт, опасен при добавлении новых экспортов в источник
+export * from './model/client.schema'
+
+// ✅ Явно — видно что именно публикуется
+export { ClientSchema, ClientListSchema } from './model/client.schema'
+```
+
+### Типы — отдельным блоком в конце файла
+
+Все типы собираются в один `export type { ... }` блок в самом конце файла. Не разбивать типы по блокам рядом с их источниками.
+
+```ts
+// ❌ Типы разбросаны по блокам
+export { ClientSchema } from './model/client.schema'
+export type { Client } from './model/client.schema'
+export { useClientStore } from './model/client.store'
+export type { ClientState } from './model/client.store'
+
+// ✅ Все типы в одном блоке в конце
+export { ClientSchema } from './model/client.schema'
+export { useClientStore } from './model/client.store'
+export type { Client, ClientState } from './model/client.types'
+```
+
+---
+
+## 3. Обязательный порядок блоков
+
+```
+1. api     — функции запросов, хуки TanStack Query, ключи кэша
+2. model   — схемы Zod, Pinia store
+3. utils   — утилиты сущности
+4. ui      — Vue-компоненты
+5. types   — export type { ... } — всегда последним
+```
+
+Каждый блок отделяется пустой строкой. Блок пропускается, если в сущности нет файлов этого сегмента.
+
+---
+
+## 4. JSDoc индексного файла
+
+Summary по шаблону — достаточно. `@description` не нужен: index.ts говорит сам за себя своей структурой.
+
+```ts
+/** Публичный API сущности client. */
+```
+
+---
+
+## 5. Эталонный пример
+
+```ts
+/** Публичный API сущности client. */
+
+// api
+export { clientApi } from './api/client.api'
+export { clientsCacheUtils } from './api/cache-utils'
+export { clientsMutations } from './api/client.mutations-keys'
+export { clientsKeys } from './api/client.query-keys'
+export { useGetCampaignByIdQuery } from './api/useGetCampaignByIdQuery'
+export { useGetClientByIdQuery } from './api/useGetClientByIdQuery'
+export { useGetClientByPhoneQuery } from './api/useGetClientByPhoneQuery'
+export { useStartClientRegistrationMutation } from './api/useStartClientRegistrationMutation'
+
+// model
+export { ClientSchema, ClientListSchema } from './model/client.schema'
+export { ClientReferralSchema } from './model/client-referral.schema'
+export { ClientMarketingSchema } from './model/client-marketing.schema'
+export { ClientBonusSchema } from './model/client-bonus.schema'
+export { useClientStore } from './model/client.store'
+
+// utils
+export { formatClientData } from './utils/client-data-helpers'
+
+// ui
+export { default as ClientDetails } from './ui/ClientDetails/ClientDetails.vue'
+export { default as ClientDetailsSkeleton } from './ui/ClientDetails/ClientDetailsSkeleton.vue'
+
+// types
+export type {
+    Client,
+    ClientArray,
+    ClientBonusArray,
+    ClientBonusItem,
+    ClientBonusRewardRequest,
+    ClientBonusRewardRequestPayload,
+    ClientBonusRewardResponse,
+    ClientMarketingCampaignArray,
+    ClientMarketingCampaignItem,
+    ClientReferralProgramArray,
+    ClientReferralProgramItem,
+    UpdateClientRequest,
+    UpdateClientRequestPayload,
+} from './model/client.types'
+```
+
+---
+
+## 6. Антипаттерны
+
+```ts
+export * from './model/client.schema' // ❌ export * запрещён
+
+export { useGetClientByIdQuery, useClientByIdQuery } // ❌ алиасы-дубликаты не публикуются
+//    выбрать одно каноническое имя
+
+export type { Client } from './model/client.schema' // ❌ типы вне общего export type блока
+
+// api                                               // ❌ комментарии-разделители блоков
+export { clientApi } from './api/client.api' //    обязательны — без них порядок
+export { useClientStore } from './model/client.store' //    не читается
+```

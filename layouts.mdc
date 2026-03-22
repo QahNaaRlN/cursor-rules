@@ -1,0 +1,219 @@
+---
+description: 'Layouts: app/layouts структура, shared/ui/layout primitives, LayoutKey, route.meta, header как виджет'
+alwaysApply: false
+globs:
+  - 'apps/*/src/app/layouts/**/*.{ts,vue}'
+  - 'apps/*/src/App.vue'
+  - 'packages/shared/ui/layout/**/*.vue'
+---
+
+# Layouts в монорепозитории CBS
+
+## Где живут layouts
+
+Layout — это **application-level UI shell** и часть инфраструктуры приложения. Он знает
+о shell-структуре, навигации, брендинге и способе встраивания страниц. В hFSD layouts
+живут на уровне `app`:
+
+```
+apps/backoffice/src/
+  app/
+    layouts/
+      DefaultLayout.vue       ← шапка + сайдбар + контентная область
+      AuthLayout.vue          ← только центрированный контент (страница логина)
+      BlankLayout.vue         ← без обёртки (fullscreen, embedded)
+```
+
+Это `app`-уровень, не `shared` и не `widgets` — layout специфичен для конкретного
+приложения и не переиспользуется между ними.
+
+---
+
+## Что шарится между приложениями
+
+Три приложения (backoffice, workstation, clientportal) имеют разные шапки,
+но одинаковую контентную обёртку. Это разделяется на **layout-primitives** в shared:
+
+```
+packages/shared/ui/
+  layout/
+    AppShell.vue          ← slot: header, slot: sidebar, slot: default
+    ContentArea.vue       ← стандартные отступы, max-width, скролл
+    PageHeader.vue        ← заголовок страницы + breadcrumbs slot + actions slot
+```
+
+**Правило shared/ui/layout:** здесь живут только structural primitives и layout wrappers.
+Они не должны содержать app-specific навигацию, route-awareness, permissions или знания
+о доменных сущностях. Нарушение этого правила — главный риск деградации слоя.
+
+```
+✅ PageHeader принимает title, subtitle, breadcrumbs slot, actions slot
+❌ PageHeader читает route или проверяет права доступа
+```
+
+`AppShell` — это "скелет" без содержимого. Каждое приложение собирает свой layout,
+вставляя в слоты свою шапку и навигацию.
+
+```vue
+<!-- apps/backoffice/src/app/layouts/DefaultLayout.vue -->
+<script setup lang="ts">
+  /**
+   * Компонент, который собирает дефолтный layout backoffice из шапки, сайдбара и контентной области.
+   */
+  import { AppShell, ContentArea } from '@cbs/shared/ui'
+  import { BackofficeHeader } from '@/widgets/backoffice-header'
+  import { BackofficeSidebar } from '@/widgets/backoffice-sidebar'
+</script>
+
+<template>
+  <AppShell>
+    <template #header>
+      <BackofficeHeader />
+    </template>
+    <template #sidebar>
+      <BackofficeSidebar />
+    </template>
+    <template #default>
+      <ContentArea>
+        <RouterView />
+      </ContentArea>
+    </template>
+  </AppShell>
+</template>
+```
+
+---
+
+## Шапка — виджет или нет?
+
+Зависит от сложности. Критерий тот же, что для любого виджета:
+
+- **Сложная шапка** — агрегирует данные пользователя, компонует features, содержит
+  UI-orchestration → это **виджет**, живёт в `src/widgets`.
+- **Простая шапка** — статический брендинг, логотип, без данных и orchestration →
+  может жить в `app/layouts` или `app/ui` как часть layout-компонента.
+
+```
+apps/backoffice/src/widgets/
+  backoffice-header/            ← виджет: auth данные + UserBar + навигация
+    ui/
+      NavMenu.vue
+    BackofficeHeader.vue
+    index.ts
+
+apps/workstation/src/widgets/
+  workstation-header/           ← виджет: другой набор элементов
+    WorkstationHeader.vue
+    index.ts
+```
+
+---
+
+## Подключение к роутеру
+
+Layout выбирается через `meta` роута — рекомендуемый стандартный подход:
+
+```typescript
+// apps/backoffice/src/app/router/routes.ts
+export const routes = [
+  {
+    path: '/login',
+    component: LoginPage,
+    meta: { layout: 'auth' },
+  },
+  {
+    path: '/orders',
+    component: OrdersPage,
+    // без meta — DefaultLayout по умолчанию
+  },
+]
+```
+
+Для типобезопасности — `LayoutKey` union type вместо строк:
+
+```typescript
+// apps/backoffice/src/app/layouts/layout.types.ts
+export type LayoutKey = 'default' | 'auth' | 'blank'
+```
+
+```typescript
+// Расширение RouterMeta — один раз на приложение
+declare module 'vue-router' {
+  interface RouteMeta {
+    layout?: LayoutKey
+  }
+}
+```
+
+```vue
+<!-- apps/backoffice/src/App.vue -->
+<script setup lang="ts">
+  /**
+   * Компонент, который выбирает layout на основе meta текущего роута.
+   */
+  import { computed } from 'vue'
+  import { useRoute } from 'vue-router'
+  import type { Component } from 'vue'
+  import type { LayoutKey } from '@/app/layouts/layout.types'
+  import AuthLayout from './app/layouts/AuthLayout.vue'
+  import BlankLayout from './app/layouts/BlankLayout.vue'
+  import DefaultLayout from './app/layouts/DefaultLayout.vue'
+
+  const route = useRoute()
+
+  const layoutMap: Record<LayoutKey, Component> = {
+    default: DefaultLayout,
+    auth: AuthLayout,
+    blank: BlankLayout,
+  }
+
+  const layout = computed(() => layoutMap[route.meta.layout ?? 'default'])
+</script>
+
+<template>
+  <component :is="layout">
+    <RouterView />
+  </component>
+</template>
+```
+
+---
+
+## Итоговая карта слоёв
+
+```
+packages/shared/ui/layout/         ← только structural primitives, без app-логики
+  AppShell.vue                      ← скелет: слоты header / sidebar / default
+  ContentArea.vue                   ← стандартные отступы контента
+  PageHeader.vue                    ← заголовок страницы (dumb: title + slots)
+
+apps/backoffice/src/
+  app/
+    layouts/
+      layout.types.ts               ← LayoutKey = 'default' | 'auth' | 'blank'
+      DefaultLayout.vue             ← AppShell + BackofficeHeader + BackofficeSidebar
+      AuthLayout.vue                ← только ContentArea по центру
+      BlankLayout.vue               ← без обёртки
+  widgets/
+    backoffice-header/              ← виджет шапки backoffice
+    backoffice-sidebar/             ← виджет навигации backoffice
+
+apps/workstation/src/
+  app/
+    layouts/
+      layout.types.ts               ← LayoutKey = 'default' | 'blank'
+      DefaultLayout.vue             ← AppShell + WorkstationHeader
+  widgets/
+    workstation-header/             ← виджет шапки workstation
+```
+
+---
+
+## Правило проверки
+
+- Изменить отступы контента во всех приложениях → правишь `ContentArea.vue` в shared.
+- Изменить шапку backoffice → правишь только `BackofficeHeader` в widgets.
+- Добавить новый layout → создаёшь файл в `app/layouts/`, добавляешь ключ в `LayoutKey`.
+- Shared layout-primitives не знают о приложениях.
+- App-level layouts знают только о собственном приложении.
+- Layout-компоненты не импортируют друг друга между приложениями.

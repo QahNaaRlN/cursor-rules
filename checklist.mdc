@@ -1,0 +1,356 @@
+---
+description: 'CBS Checklist: жёсткие запреты и обязательные требования для JSDoc, TanStack Query, Zod, index.ts, hFSD-импортов и именования файлов. Применяется при каждой генерации и редактировании кода.'
+alwaysApply: true
+globs:
+  - 'apps/**/src/**/*.{ts,vue}'
+  - 'packages/**/src/**/*.{ts,vue}'
+  - '**/index.ts'
+---
+
+# CBS Cursor Rules — Checklist
+
+Каждый пункт — жёсткий запрет или обязательное требование. Исключений нет без явного обоснования на ревью.
+
+---
+
+## JSDoc
+
+### @param и @returns — без типов в фигурных скобках
+
+```
+// ❌ ЗАПРЕЩЕНО
+* @param {string} name - Имя.
+* @param {MaybeRefOrGetter<boolean>} enabled - Флаг.
+* @returns {Promise<AuthToken>} Токен.
+
+// ✅ ОБЯЗАТЕЛЬНО
+* @param name - Имя.
+* @param enabled - Флаг активности запроса.
+* @returns JWT-токен сессии.
+```
+
+### Порядок тегов — строго фиксированный
+
+```
+summary → @description → @param → @returns → @throws → @example
+```
+
+Нарушение порядка — ошибка. Теги не переставлять, не пропускать без причины.
+
+### @description — только наблюдаемый side-effect, не детали реализации
+
+```
+// ❌ ЗАПРЕЩЕНО — описывает внутренний пайплайн
+* @description Валидирует payload через Zod и отправляет в API.
+* @description Ошибки попадают в ApiValidationError и AxiosError.
+
+// ✅ ОБЯЗАТЕЛЬНО — что видит вызывающий код
+* @description При успехе показывает toast и перенаправляет на главную.
+* @description При ошибке показывает нейтральный toast.
+```
+
+### @throws — обязателен для функций с API или Zod, конкретные классы
+
+```
+// ❌ ЗАПРЕЩЕНО — слишком общо
+* @throws {Error} Пробрасывает ошибку.
+
+// ✅ ОБЯЗАТЕЛЬНО — конкретный класс и условие
+* @throws {ZodError} При несоответствии ответа схеме StaffAuthApiSchema.
+* @throws {ApiError} При ошибке сервера (4xx/5xx).
+```
+
+### @example — обязателен для shared/ и entities/, только вызов без лишних импортов
+
+```
+// ❌ ЗАПРЕЩЕНО — лишние импорты в примере
+* @example
+* import { z } from 'zod'
+* import { parseZodError } from '@cbs/shared'
+* const MySchema = z.object({ query: z.string() })
+* const result = MySchema.safeParse({})
+* if (!result.success) parseZodError('MySchema', result.error)
+
+// ✅ ОБЯЗАТЕЛЬНО — только вызов
+* @example
+* const result = MySchema.safeParse({})
+* if (!result.success) console.error(parseZodError('MySchema', result.error))
+```
+
+### JSDoc блок — непосредственно перед экспортом, не над импортами
+
+```
+// ❌ ЗАПРЕЩЕНО
+/**
+ * Хук, который...
+ */
+import { computed } from 'vue'
+import { useQuery } from '...'
+
+export function useMyHook() {
+
+// ✅ ОБЯЗАТЕЛЬНО
+import { computed } from 'vue'
+import { useQuery } from '...'
+
+/**
+ * Хук, который...
+ */
+export function useMyHook() {
+```
+
+### Summary — обязательный шаблон
+
+```
+// ❌ ЗАПРЕЩЕНО
+/** Авторизация */
+/** Хук для авторизации */
+/** Возвращает данные пользователя */
+
+// ✅ ОБЯЗАТЕЛЬНО — "[Тип сущности], который/которая [глагол + суть]"
+/** Хук, который предоставляет данные авторизованного сотрудника. */
+/** Утилита, которая форматирует номер телефона в маску +7 (XXX) XXX-XX-XX. */
+/** Стор, который управляет состоянием поиска заказов. */
+```
+
+### Комментарии // запрещены в .ts файлах
+
+```
+// ❌ ЗАПРЕЩЕНО
+// Состояние поиска
+const searchType = ref('order')
+
+// ✅ ОБЯЗАТЕЛЬНО
+/* Состояние поиска */
+const searchType = ref('order')
+```
+
+---
+
+## TanStack Query
+
+### isPending вместо isLoading для скелетонов (v5)
+
+```
+// ❌ ЗАПРЕЩЕНО — isLoading в v5 = isPending && isFetching
+const { data, isLoading } = useQuery(...)
+return { data, isLoading }
+
+// ✅ ОБЯЗАТЕЛЬНО
+const { data, isPending } = useQuery(...)
+return { data, isPending }
+```
+
+### queryKey и mutationKey — только из централизованных файлов
+
+```
+// ❌ ЗАПРЕЩЕНО — инлайн строки и массивы
+useQuery({ queryKey: ['staff', id], ... })
+useQuery({ queryKey: computed(() => [...staffQueryKeys.all(), 'by-token', id]), ... })
+useMutation({ mutationKey: ['staff', 'update'], ... })
+
+// ✅ ОБЯЗАТЕЛЬНО — из *.query-keys.ts и *.mutations-keys.ts
+useQuery({ queryKey: computed(() => staffQueryKeys.byId(id)), ... })
+useMutation({ mutationKey: staffMutations.update(), ... })
+```
+
+### Возврат состояний — только потребляемые компонентом
+
+```
+// ❌ ЗАПРЕЩЕНО — возвращать "на всякий случай"
+return { data, isPending, isFetching, isSuccess, isError, error, refetch }
+
+// ✅ ОБЯЗАТЕЛЬНО — только то что реально используется снаружи
+return { data, isPending }
+```
+
+### throwOnError и showToastOnError не комбинируются на одном запросе
+
+```
+// ❌ ЗАПРЕЩЕНО — пользователь получит и boundary, и toast
+useQuery({
+  throwOnError: true,
+  meta: { showToastOnError: true },
+})
+
+// ✅ ОБЯЗАТЕЛЬНО — один primary UI-path
+useQuery({ throwOnError: true })                        // критичные данные
+useQuery({ meta: { showToastOnError: true } })          // некритичные данные
+```
+
+### ToastService в onError мутации — только с suppressToast
+
+```
+// ❌ ЗАПРЕЩЕНО — пользователь увидит два тоста
+useMutation({
+  onError: (error) => ToastService.showError(message),
+})
+
+// ✅ ОБЯЗАТЕЛЬНО
+useMutation({
+  meta: { suppressToast: true },
+  onError: (error) => ToastService.showError(message),
+})
+```
+
+---
+
+## Zod
+
+### Нельзя добавлять .nullable() ради замалчивания нарушения контракта
+
+```
+// ❌ ЗАПРЕЩЕНО — скрывает нарушение контракта данных
+first_name: z.string().nullable()  // ← потому что источник иногда шлёт null
+
+// ✅ ОБЯЗАТЕЛЬНО — схема отражает контракт, не фактическое поведение
+first_name: z.string()
+```
+
+### z.infer / z.input / z.output — только в .schema.ts, не в .types.ts
+
+```
+// ❌ ЗАПРЕЩЕНО — в operation.types.ts
+export type Operation = z.infer<typeof OperationSchema>
+
+// ✅ ОБЯЗАТЕЛЬНО — в operation.schema.ts, рядом со схемой
+export const OperationSchema = z.object({ ... })
+export type Operation = z.infer<typeof OperationSchema>
+```
+
+### ZodError не логировать в API-функциях
+
+```
+// ❌ ЗАПРЕЩЕНО — логирование в каждой API-функции
+if (!result.success) {
+  console.error('[MySchema]', z.prettifyError(result.error))
+  throw result.error
+}
+
+// ✅ ОБЯЗАТЕЛЬНО — только throw, логирование централизовано в normalizeError
+if (!result.success) throw result.error
+```
+
+---
+
+## index.ts
+
+### export \* запрещён
+
+```
+// ❌ ЗАПРЕЩЕНО
+export * from './model/client.schema'
+
+// ✅ ОБЯЗАТЕЛЬНО
+export { ClientSchema, ClientListSchema } from './model/client.schema'
+```
+
+### Обязательная структура с разделителями и JSDoc
+
+```
+// ❌ ЗАПРЕЩЕНО — без структуры
+export { useSearchOrderStore } from './search-order.store'
+export * from './search-order.types'
+
+// ✅ ОБЯЗАТЕЛЬНО
+/** Публичный API фичи search-order. */
+
+// api
+export { ... } from './api/...'
+
+// model
+export { ... } from './model/...'
+
+// ui
+export { ... } from './ui/...'
+
+// types
+export type { ... } from './model/...'
+```
+
+### Типы — единым блоком export type { } в конце
+
+```
+// ❌ ЗАПРЕЩЕНО — типы разбросаны по блокам
+export { ClientSchema } from './model/client.schema'
+export type { Client } from './model/client.schema'
+
+// ✅ ОБЯЗАТЕЛЬНО — все типы в одном блоке последним
+export { ClientSchema } from './model/client.schema'
+
+// types
+export type { Client, ClientState } from './model/client.types'
+```
+
+---
+
+## hFSD — импорты и структура
+
+### Импорты только через index.ts, не через внутренние пути
+
+```
+// ❌ ЗАПРЕЩЕНО — обход публичного API
+import { useClientByPhoneQuery } from '@cbs/entities/client/api/useGetClientByPhoneQuery'
+import type { OrderArray } from '@cbs/entities/order/model/orderTypes'
+
+// ✅ ОБЯЗАТЕЛЬНО
+import { useClientByPhoneQuery } from '@cbs/entities/client'
+import type { OrderArray } from '@cbs/entities/order'
+```
+
+### Хуки TanStack Query — только в сегменте api/, не queries/
+
+```
+// ❌ ЗАПРЕЩЕНО
+features/search-order/queries/useClientSearchChain.ts
+
+// ✅ ОБЯЗАТЕЛЬНО
+features/search-order/api/useClientSearchChain.ts
+```
+
+---
+
+## Toast
+
+- Необходимо соблюдать **`toast.mdc`**: красный toast ошибки по умолчанию **без** автозакрытия по таймеру; успех / инфо / предупреждение — с таймаутами из стандарта.
+- Необходимо показывать уведомления через **`ToastService`**, не через прямой `useToast` во фичах.
+- Необходимо явно передавать **`timeout`** в `showError`, только если нужно автозакрытие (например, второстепенная ошибка копирования).
+- Глобальные ошибки TanStack Query не дублировать с ручным `ToastService` без **`suppressToast`** — см. `error-handling.mdc`.
+
+---
+
+## Именование файлов
+
+### Суффикс через точку, не через подчёркивание
+
+```
+// ❌ ЗАПРЕЩЕНО
+order-production-units_types.ts
+search-order_schema.ts
+
+// ✅ ОБЯЗАТЕЛЬНО
+order-production-units.types.ts
+search-order.schema.ts
+```
+
+### Суффикс mutations-keys во множественном числе
+
+```
+// ❌ ЗАПРЕЩЕНО
+search-order.mutation-keys.ts
+
+// ✅ ОБЯЗАТЕЛЬНО
+search-order.mutations-keys.ts
+```
+
+### Имя файла совпадает с именем экспорта 1-к-1
+
+```
+// ❌ ЗАПРЕЩЕНО
+// файл: auth.query-keys.ts
+export const authKeys = { ... }
+
+// ✅ ОБЯЗАТЕЛЬНО
+// файл: auth.query-keys.ts
+export const authQueryKeys = { ... }
+```

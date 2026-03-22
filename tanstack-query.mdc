@@ -1,0 +1,244 @@
+---
+description: Стандарты использования TanStack Query, именования хуков и структуры файлов в рамках hFSD архитектуры.
+globs:
+  - 'packages/**/api/*.ts'
+  - 'apps/**/api/*.ts'
+---
+
+# TanStack Query & API Standards
+
+Ты — эксперт по архитектуре FSD и TanStack Query. Твоя задача — поддерживать идеальную структуру слоя `api` и типизацию запросов.
+
+## 1. Расположение и Структура
+
+- **Сегмент**: Все хуки TanStack Query ДОЛЖНЫ находиться в сегменте `api` внутри слайса (`entities/[slice]/api` или `features/[slice]/api`).
+- **Изоляция**: Чистые Axios-запросы выносятся в отдельный файл `request.ts` (или `[slice].api.ts`) внутри той же папки `api`. Хуки вызывают эти функции.
+- **Один файл — один хук**: Запрещено группировать несколько `useQuery` или `useMutation` в одном файле.
+
+## 2. Правила Именования
+
+Следовать строгому шаблону: `use[Action][Entity][Type].ts`
+
+- **Action**: Get, Create, Update, Delete, Search, Sync.
+- **Entity**: Сущность в единственном или множественном числе (User, Orders, Auth).
+- **Type**: Query (для GET) или Mutation (для POST, PUT, DELETE, PATCH).
+
+### Примеры
+
+- ✅ `useGetOrdersQuery.ts`
+- ✅ `useCreateOrderMutation.ts`
+- ❌ `useOrders.ts` (непонятно действие и тип)
+- ❌ `queries.ts` (группировка запрещена)
+
+## 3. Требования к Коду
+
+- **Типизация**: Каждый хук должен иметь четко определенные типы для `Data`, `Error` и `Variables`.
+- **Интеграция с Axios**: Использовать инстанс из `@cbs/api`.
+- **Трансформация данных**: snake_case → camelCase происходит в Zod-схеме
+  внутри функции-запроса. `select` используется только для производных
+  вычислений из уже нормализованных данных:
+
+### ✅ select для производного вычисления
+
+```typescript
+useQuery({ queryFn: fetchOrders, select: orders => orders.filter(o => o.status === 'active') })
+```
+
+### ❌ select для трансформации ключей — это работа Zod
+
+```ts
+useQuery({ queryFn: fetchOrders, select: (data) => ({ orderId: data.order_id }) // неверно })
+```
+
+## 4. Централизованные ключи (queryKey / mutationKey)
+
+**Все ключи — query и mutation — берутся из централизованных файлов ключей.**
+Инлайн-ключи в виде строк или массивов непосредственно в хуке запрещены.
+
+### Файлы ключей
+
+Каждый слайс entity хранит ключи в двух отдельных файлах:
+
+```ts
+packages/entities/client/api/
+  client.query-keys.ts      ← ключи для useQuery
+  client.mutations-keys.ts  ← ключи для useMutation
+```
+
+### Структура файла query-keys
+
+```typescript
+// packages/entities/client/api/client.query-keys.ts
+
+/**
+ * Утилита, которая предоставляет типизированные ключи кэша для сущности client.
+ */
+export const clientQueryKeys = {
+  all: () => ['clients'] as const,
+  byId: (id: number) => ['clients', id] as const,
+  byPhone: (phone: string) => ['clients', 'phone', phone] as const,
+} as const
+```
+
+### Структура файла mutations-keys
+
+```typescript
+// packages/entities/client/api/client.mutations-keys.ts
+
+/**
+ * Утилита, которая предоставляет типизированные ключи мутаций для сущности client.
+ */
+export const clientMutations = {
+  update: () => ['clients', 'update'] as const,
+  updatePhone: () => ['clients', 'update', 'phone'] as const,
+  updateBonuses: () => ['clients', 'update', 'bonuses'] as const,
+} as const
+```
+
+### Использование в хуках
+
+```typescript
+// ✅ Правильно — ключ из централизованного файла
+export const useGetClientByIdQuery = (id: MaybeRefOrGetter<number>) =>
+  useQuery<Client, Error>({
+    queryKey: clientQueryKeys.byId(toValue(id)),
+    queryFn: () => fetchClientById(toValue(id)),
+  })
+
+// ✅ Правильно — mutationKey из централизованного файла
+export const useUpdateClientPhoneMutation = () =>
+  useMutation<void, Error, UpdateClientPhoneRequest>({
+    mutationKey: clientMutations.updatePhone(),
+    mutationFn: updateClientPhone,
+  })
+```
+
+```typescript
+// ❌ Запрещено — инлайн строковый ключ
+useMutation({
+    mutationKey: ['requestPhoneUpdate'] as const,
+    mutationFn: updateClientPhone,
+})
+
+// ❌ Запрещено — инлайн массив в useQuery
+useQuery({
+    queryKey: ['clients', id],
+    queryFn: fetchClientById,
+})
+
+// ❌ Запрещено — ключ определён прямо в файле хука
+const MUTATION_KEY = ['clients', 'update'] as const
+useMutation({ mutationKey: MUTATION_KEY, ... })
+```
+
+### Экспорт через index.ts
+
+Оба файла ключей экспортируются через публичный API слайса:
+
+```typescript
+// packages/entities/client/index.ts
+
+// api
+export { clientQueryKeys } from './api/client.query-keys'
+export { clientMutations } from './api/client.mutations-keys'
+```
+
+### Зачем это нужно
+
+Централизованные ключи решают три задачи:
+
+- **Инвалидация**: `queryClient.invalidateQueries({ queryKey: clientQueryKeys.all() })`
+  работает предсказуемо — нет риска опечатки в строке.
+- **Отмена запросов**: `queryClient.cancelQueries({ queryKey: clientQueryKeys.byId(id) })`
+  ищет по тому же объекту, что использовался при создании.
+- **Devtools**: читаемые иерархичные ключи вместо magic strings.
+
+## 5. Правило Исправления (Enforcement)
+
+Если при открытии файла или работе в папке `api` обнаружены отклонения от этих правил:
+
+1. Необходимо предупредить пользователя о нарушении стандарта.
+2. Необходимо предложить автоматическое исправление: разделение файлов, переименование хука или перенос в правильный слой FSD.
+3. Необходимо не писать новый код в старом стиле, даже если текущий файл ему следует. Всегда внедрять стандарт.
+
+## 6. Интеграция с системой обработки ошибок
+
+Хуки TanStack Query управляют отображением ошибок через `meta`-флаги.
+Полная матрица сценариев описана в `error-handling.mdc`.
+Типы toast и таймауты (ошибка по умолчанию без автозакрытия) — `toast.mdc`.
+
+### Флаги `meta` для управления Toast
+
+| Флаг                     | Тип              | Когда использовать                                    |
+| ------------------------ | ---------------- | ----------------------------------------------------- |
+| `suppressToast: true`    | mutation / query | Тихая операция, Toast не нужен                        |
+| `showToastOnError: true` | только query     | GET-запрос должен показать Toast при ошибке           |
+| `throwOnError: true`     | только query     | Критичный запрос, ошибка делегируется в ErrorBoundary |
+
+```typescript
+// Мутация без Toast (фоновое сохранение)
+useMutation({ meta: { suppressToast: true }, ... })
+
+// Мутация с кастомным Toast — ОБЯЗАТЕЛЬНО suppressToast
+useMutation({
+    meta: { suppressToast: true },
+    onError: (error) => {
+        const appError = normalizeError(error)
+        if (appError.code === 'HTTP_422') {
+            ToastService.showError('Специфичный текст для этого экрана')
+        } else {
+            ToastService.showError(appError.message)
+        }
+    }
+})
+
+// GET критичной страницы
+useQuery({ throwOnError: true, ... })
+
+// GET с Toast при ошибке (поллинг)
+useQuery({ meta: { showToastOnError: true }, ... })
+```
+
+> ⚠️ Запрещено писать `ToastService.showError` в `onError` без
+> `meta: { suppressToast: true }` — пользователь увидит два Toast подряд.
+
+## 7. Правило возврата состояний
+
+Хук возвращает только те состояния которые реально потребляются снаружи.
+
+✅ Минимальный хук — нет явных потребителей состояний:
+
+```typescript
+export const useGetProductsQuery = (options?: { enabled?: boolean }) =>
+  useQuery<Product[], Error>({
+    queryKey: productCatalogQueryKeys.products.all(),
+    queryFn: fetchProducts,
+    enabled: options?.enabled ?? true,
+  })
+```
+
+✅ Расширенный хук — компонент использует все возвращаемые значения:
+
+```typescript
+export const useGetOrderByIdQuery = (orderId: MaybeRefOrGetter<number>) => {
+    const { data, isLoading, isError, error, refetch } = useQuery<Order, Error>({...})
+    return { order: data, isLoading, isError, error, refetch }
+}
+```
+
+❌ Избыточный возврат — возвращается то что никто не использует:
+
+```typescript
+return {
+  order,
+  isLoading,
+  isFetching, // ← используется?
+  isSuccess, // ← используется?
+  isError, // ← используется?
+  error, // ← используется?
+  refetch,
+}
+```
+
+**Правило:** Перед добавлением состояния в `return` — убедись что компонент
+его потребляет. Неиспользуемые состояния создают ложное ощущение контроля.

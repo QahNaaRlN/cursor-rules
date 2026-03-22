@@ -1,0 +1,352 @@
+---
+description: 'Modal standard: useModal, VueFinalModal, Pinia UI-state for modals, dumb modal components by default, ModalsContainer in App.vue'
+alwaysApply: false
+globs:
+  - 'packages/shared/ui/modals/**/*.vue'
+  - 'packages/shared/lib/modals/**/*.ts'
+  - 'packages/entities/**/ui/**Modal*.vue'
+  - 'packages/features/**/ui/**Modal*.vue'
+  - 'apps/**/widgets/**/ui/**Modal*.vue'
+  - 'apps/**/widgets/**/model/*Modal*.ts'
+---
+
+# Стандарт модальных окон (CBS)
+
+Проект использует **vue-final-modal v4** (`useModal`, `VueFinalModal`, `ModalsContainer`).
+Этот документ описывает где живут модалки, как управляется их состояние и как они
+интегрируются с hFSD и Pinia.
+
+---
+
+## 1. Инфраструктура: регистрация в app
+
+`ModalsContainer` — единственный глобальный элемент, необходимый vue-final-modal.
+Регистрируется один раз в `App.vue` каждого приложения:
+
+```vue
+<!-- apps/backoffice/src/App.vue -->
+<template>
+  <component :is="layout">
+    <RouterView />
+  </component>
+  <ModalsContainer />
+  ← всегда последним, вне layout
+</template>
+
+<script setup lang="ts">
+  import { ModalsContainer } from 'vue-final-modal'
+</script>
+```
+
+---
+
+## 2. Классификация модалок по hFSD
+
+Классификация модалки определяется двумя осями:
+
+- **чьи данные она отображает** — определяет где живёт компонент
+- **инкапсулирует ли она самостоятельный пользовательский сценарий** — определяет
+  это entities или features
+
+| Тип модалки                                  | Где живёт компонент               | Где живёт состояние |
+| :------------------------------------------- | :-------------------------------- | :------------------ |
+| Системная (confirm, alert)                   | `packages/shared/ui/modals/`      | shared composable   |
+| UI-представление одной сущности без сценария | `packages/entities/[entity]/ui/`  | inline `useModal()` |
+| Пользовательский сценарий / orchestration    | `packages/features/[feature]/ui/` | Pinia store фичи    |
+| Агрегирует несколько сущностей               | `apps/*/src/widgets/[widget]/ui/` | Pinia store виджета |
+| Специфична для приложения                    | `apps/*/src/widgets/[widget]/ui/` | Pinia store виджета |
+
+**Критерий выбора между entities и features:**
+
+- Модалка только отображает или редактирует данные одной сущности без самостоятельного
+  сценария → `entities/[entity]/ui`
+- Модалка инкапсулирует пользовательский сценарий, actions или orchestration →
+  `features/[feature]/ui`, даже если визуально "про одну сущность"
+
+---
+
+## 3. Управление состоянием: три уровня
+
+Стандартным способом управления модалками в проекте является `useModal()`.
+Template-driven control через `v-model` не используется — чтобы не плодить
+альтернативные паттерны modal lifecycle.
+
+### Уровень 1 — Inline (локальная модалка)
+
+Если модалка открывается только из одного места и не нужна снаружи — `useModal()` inline
+в компоненте без Pinia. Это **предпочтительный путь по умолчанию**:
+
+```typescript
+// apps/backoffice/src/widgets/order-search-panel/OrderSearchPanel.vue
+const { open, close } = useModal({
+  component: OrderDetailsModal,
+  attrs: {
+    orderId: selectedOrderId.value,
+    onClose: () => close(),
+  },
+})
+```
+
+### Уровень 2 — Pinia store слайса
+
+Pinia используется когда modal state должен разделяться внутри slice, переживать
+несколько точек открытия или участвовать в orchestration сценария:
+
+```typescript
+// apps/backoffice/src/widgets/client-management/model/useClientEditModalStore.ts
+import { defineStore } from 'pinia'
+import { ref } from 'vue'
+
+/**
+ * Стор, который управляет состоянием модалки редактирования клиента.
+ */
+export const useClientEditModalStore = defineStore('clientEditModal', () => {
+  // ─── state ────────────────────────────────────────────────────────────
+  const isOpen = ref(false)
+  const clientId = ref<number | null>(null)
+
+  // ─── actions ──────────────────────────────────────────────────────────
+  const open = (id: number) => {
+    clientId.value = id
+    isOpen.value = true
+  }
+
+  const close = () => {
+    isOpen.value = false
+    clientId.value = null // сбрасываем данные при закрытии
+  }
+
+  return { isOpen, clientId, open, close }
+})
+```
+
+### Уровень 3 — Shared composable для системных модалок
+
+Для confirm/alert/prompt — composable в `shared`, который управляет экземпляром
+через `useModal()` напрямую без Pinia:
+
+```typescript
+// packages/shared/lib/modals/useConfirmModal.ts
+
+interface ConfirmOptions {
+  title: string
+  message: string
+  confirmLabel?: string
+  cancelLabel?: string
+}
+
+/**
+ * Composable, который открывает системную модалку подтверждения и возвращает Promise с результатом.
+ * @example
+ * const { confirm } = useConfirmModal()
+ * const ok = await confirm({ title: 'Удалить?', message: 'Нельзя отменить.' })
+ */
+export function useConfirmModal() {
+  return {
+    confirm: (options: ConfirmOptions): Promise<boolean> =>
+      new Promise(resolve => {
+        const { open, close } = useModal({
+          component: ConfirmModal,
+          attrs: {
+            ...options,
+            onConfirm: () => {
+              close()
+              resolve(true)
+            },
+            onCancel: () => {
+              close()
+              resolve(false)
+            },
+          },
+        })
+        open()
+      }),
+  }
+}
+```
+
+**Использование в feature:**
+
+```typescript
+const { confirm } = useConfirmModal()
+
+const handleDeleteOrder = async () => {
+  const confirmed = await confirm({
+    title: 'Удалить заказ?',
+    message: 'Это действие нельзя отменить.',
+  })
+  if (!confirmed) return
+  deleteOrder(orderId)
+}
+```
+
+---
+
+## 4. Компонент модалки
+
+По умолчанию компонент модалки — **presentational/dumb**: получает данные через props
+и сообщает о действиях через emits. Это защищает от деградации, когда modal незаметно
+превращается в мини-widget со своими запросами и мутациями.
+
+Исключения допустимы для **interaction-heavy flows** (многошаговый wizard, rich editor,
+draft с autosave), если вся логика остаётся в рамках ownership своего слайса.
+
+```vue
+<!-- packages/entities/client/ui/ClientEditModal.vue -->
+<script setup lang="ts">
+  /**
+   * Компонент, который отображает модалку редактирования данных клиента.
+   * @prop {Client} client - Данные клиента для редактирования.
+   * @emit {Client} confirm - Пользователь подтвердил изменения.
+   * @emit {void} cancel - Пользователь отменил редактирование.
+   */
+  import { VueFinalModal } from 'vue-final-modal'
+  import type { Client } from '../model/client.types'
+
+  defineProps<{ client: Client }>()
+  const emit = defineEmits<{
+    confirm: [updated: Client]
+    cancel: []
+  }>()
+</script>
+
+<template>
+  <VueFinalModal
+    class="flex items-center justify-center"
+    content-class="w-full max-w-lg rounded-xl bg-white p-6"
+    overlay-transition="vfm-fade"
+    content-transition="vfm-slide-down"
+  >
+    <slot />
+  </VueFinalModal>
+</template>
+```
+
+---
+
+## 5. Продвинутый паттерн: Pinia store + useModal + watch
+
+> ⚠️ Этот паттерн — для случаев, когда modal lifecycle действительно нужно
+> координировать между несколькими частями slice. Для простых случаев
+> достаточно inline `useModal()` из §3 Уровень 1.
+
+```vue
+<!-- apps/backoffice/src/widgets/client-management/ClientManagement.vue -->
+<script setup lang="ts">
+  /**
+   * Виджет, который управляет данными клиента и открытием модалок редактирования.
+   */
+  import { computed, watch } from 'vue'
+  import { useModal } from 'vue-final-modal'
+  import { useGetClientQuery } from '@cbs/entities/client'
+  import { ClientEditModal } from '@cbs/entities/client'
+  import { useEditClientData } from '@cbs/features/edit-client-data'
+  import { useClientEditModalStore } from './model/useClientEditModalStore'
+
+  const modalStore = useClientEditModalStore()
+  const { mutate: editClient } = useEditClientData()
+
+  const { data: client } = useGetClientQuery(computed(() => modalStore.clientId))
+
+  const { open, close, patchOptions } = useModal({
+    component: ClientEditModal,
+    attrs: {
+      client: client.value,
+      onConfirm: updated => {
+        editClient(updated)
+        close()
+        modalStore.close()
+      },
+      onCancel: () => {
+        close()
+        modalStore.close()
+      },
+    },
+  })
+
+  // Синхронизируем store с useModal
+  watch(
+    () => modalStore.isOpen,
+    isOpen => {
+      if (isOpen) {
+        patchOptions({ attrs: { client: client.value } })
+        open()
+      } else {
+        close()
+      }
+    },
+  )
+</script>
+```
+
+---
+
+## 6. Правила
+
+**Допустимо:**
+
+- `useModal()` inline в компоненте — для модалок с единственным местом открытия.
+- Pinia store в `model/` слайса — для модалок, открываемых из нескольких мест.
+- `useConfirmModal()` из shared — для системных confirm/alert диалогов.
+- Локальная UI-логика внутри modal component — для interaction-heavy flows в рамках своего слайса.
+
+**Запрещено:**
+
+- Вызов `useMutation` внутри компонента модалки — мутации живут в features.
+- Вызов `useQuery` внутри компонента модалки по умолчанию — данные приходят через props.
+- Глобальный стор со всеми модалками приложения — стор живёт в `model/` своего слайса.
+- Хранение серверных данных (ответов API) в modal store — это зона TanStack Query.
+
+---
+
+## 7. Антипаттерны
+
+```typescript
+// ❌ Мутация внутри компонента модалки
+// ClientEditModal.vue
+const { mutate } = useUpdateClientMutation()
+const handleConfirm = () => mutate(formData)
+// Мутация должна вызываться в feature и передаваться через onConfirm attrs
+
+// ❌ useQuery внутри компонента модалки (без явного обоснования)
+// ClientEditModal.vue
+const { data: client } = useGetClientQuery(props.clientId)
+// Данные должны прийти через props — виджет достаёт, модалка отображает
+
+// ❌ Глобальный стор для всех модалок приложения
+export const useModalsStore = defineStore('modals', () => ({
+  isClientEditOpen: ref(false),
+  isOrderDetailsOpen: ref(false),
+  isUserProfileOpen: ref(false),
+  // ... все модалки в одном сторе — быстро превращается в registry всего подряд
+}))
+
+// ❌ Template-driven control через v-model вместо useModal()
+// <ClientEditModal v-model="isOpen" :client-id="selectedId" />
+// В проекте стандартный путь — useModal(), а не v-model в parent template
+```
+
+---
+
+## 8. Итоговая карта
+
+```ts
+packages/shared/
+  ui/modals/
+    ConfirmModal.vue              ← системная модалка подтверждения
+    AlertModal.vue                ← системная модалка уведомления
+  lib/modals/
+    useConfirmModal.ts            ← composable для программного вызова confirm
+
+packages/entities/client/
+  ui/
+    ClientEditModal.vue           ← dumb-компонент: props + emits, без хуков
+
+apps/backoffice/src/
+  widgets/client-management/
+    model/
+      useClientEditModalStore.ts  ← UI-состояние: isOpen, clientId
+    ui/
+      ClientEditModal.vue         ← если модалка специфична для этого виджета
+    ClientManagement.vue          ← виджет: useModal() + watch store + мутации
+```

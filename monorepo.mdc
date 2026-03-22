@@ -1,0 +1,56 @@
+---
+description: CBS monorepo - backoffice, workstation, clientportal apps; Vue/Vite/Tailwind/hFSD; Infisical secrets; Docker/Turborepo; API camelCase/snake_case and shared packages.
+alwaysApply: false
+globs:
+    - 'apps/*/src/**/*.{ts,vue,json}'
+    - 'packages/*/src/**/*.{ts,vue,json}'
+---
+
+# Инструкции и контекст проекта CBS (Core Business System)
+
+## 1. Общий контекст
+
+Мы разрабатываем **CBS** — фронтенд-монорепозиторий для системы прачечных.
+Проект включает три основных приложения:
+
+- `backoffice` — панель администратора.
+- `workstation` — рабочее место операциониста.
+- `clientportal` — портал для клиентов.
+
+## 2. Технологический стек и архитектура
+
+- **Build System**: pnpm workspaces + Turborepo для оркестрации.
+- **Frontend**: Vue.js + Vite + Tailwind + Tanstack query + Zod + Tanstack Form + TS.
+- **Design Pattern**: hardened Feature-Sliced Design (hFSD).
+- **Секреты**: Infisical CLI (управление через Machine Identity).
+- **Infrastructure**: Docker (multi-stage), Nginx, GitLab CI/CD, Helm.
+
+## 3. Управление секретами и префиксами (Infisical)
+
+Секреты хранятся в иерархии папок: `/apps/[app-name]`.
+
+- **Общие секреты**: `VITE_BASE_API_URL`, `VITE_API_TIMEOUT` (хранятся в корне `/`).
+- **Специфичные секреты**: `VITE_API_PREFIX` (хранится в папке приложения).
+- **Роутинг**: Приложения работают на общем домене `cbs.test`, но с префиксами путей:
+  - Workstation: `/workstation/api/...`
+  - Backoffice: `/backoffice/api/...`
+
+## 4. Правила разработки (Shared Layer & API)
+
+- **Axios Instance**: Находится в `packages/api`. Экспортирует `initApi(config)` — принимает готовую конфигурацию, не читает `VITE_*` переменные напрямую. Чтение env и вызов `initApi` происходит в `apps/*/src/app/bootstrap/api.ts`.
+- **Маппинг данных**:
+  - Frontend использует `camelCase`.
+  - Backend использует `snake_case`.
+  - Zod отвечает за трансформацию маппинга через `zod.transform()`.
+
+## 5. Инфраструктурные правила (Docker)
+
+- **Dockerfile**: Использует `turbo prune --scope=${APP_NAME} --docker` для минимизации контекста.
+- **Установка Infisical**: В Docker-образе используется прямая установка бинарного файла с GitHub (amd64) во избежание проблем с RSA-ключами Alpine.
+- **Сборка**: Команда сборки должна всегда оборачиваться в `infisical run` с флагами `--projectId`, `--path` и `--include-imports`.
+
+## 6. Команды и скрипты
+
+- Запуск разработки: `pnpm dev` (запускает turbo dev).
+- Сборка MVP: `pnpm infra:build` (через docker-compose).
+- Локальный прокси: Проекты доступны по именам `*.local` (настроено в `docker/local-nginx.conf`).

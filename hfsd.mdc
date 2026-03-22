@@ -1,0 +1,475 @@
+---
+description: 'hFSD (Hardened Feature-Sliced Design) - layer order (shared → api → entities → features → widgets → pages → app), unidirectional imports only, type-only cross-entity imports allowed via index.ts, public API via index.ts; packages/shared, packages/api, packages/entities, packages/features and apps/*/src (features, widgets, pages, app).'
+alwaysApply: false
+globs:
+  - 'packages/{shared,api,entities,features}/src/**/*.{ts,vue}'
+  - 'apps/*/src/{features,widgets,pages,app}/**/*.{ts,vue}'
+---
+
+# 📖 Архитектурный стандарт: hFSD в Монорепозитории (CBS)
+
+Этот документ описывает, как методология **Feature-Sliced Design (FSD)** применяется в нашем масштабируемом монорепозитории (Turborepo). Мы объединяем строгую изоляцию слоёв FSD с физическим разделением на npm-пакеты.
+
+## 1. Философия архитектуры
+
+Наша цель — создать систему, в которой изменение логики в одном месте не ломает другие части приложения.
+
+- **FSD даёт правила направления зависимостей:** код может зависеть только от того кода, который лежит "ниже" него.
+- **Монорепозиторий даёт переиспользуемость:** базовые слои вынесены в отдельные пакеты и шарятся между `workstation`, `backoffice` и `clientportal`.
+- **Физические границы важнее конвенций:** правила, которые нельзя проверить линтером или сборщиком — это пожелания, а не стандарт.
+
+---
+
+## 2. Глобальная структура (Карта слоёв)
+
+Проект физически разделён на две зоны: **Общие пакеты (`packages/*`)** и **Приложения (`apps/*`)**.
+
+### 📦 Базовые слои (packages/\*)
+
+Это фундамент. Эти пакеты линкуются локально и не содержат бизнес-логики, специфичной для конкретного приложения.
+
+1. **`packages/shared` (Слой Shared)**
+   - **Что здесь:** UI-кит (кнопки, инпуты), утилиты, общие типы, глобальная обработка ошибок (`normalizeError`).
+   - **Критерий:** Код должен быть таким, чтобы его можно было выложить в Open Source — он не знает ни о домене, ни о приложении.
+   - **Зависимости:** Не может импортировать **ничего** из других пакетов монорепозитория.
+
+2. **`packages/api` (Инфраструктурный пакет)**
+   - **Что здесь:** Axios-инстанс, интерсепторы, базовая обработка HTTP-ошибок. Экспортирует `initApi(config)`.
+   - **Почему отдельно от shared:** `shared` — context-free. `api` знает о конфигурации приложения — это инфраструктура, а не примитив.
+   - **Важно:** Пакет принимает уже готовую конфигурацию — он не читает `VITE_*` переменные напрямую. Разбор env происходит в `apps/*/src/app/bootstrap` и передаётся через `initApi`.
+   - **Зависимости:** Может импортировать только из `@cbs/shared`.
+
+   ```typescript
+   // ✅ Правильно — пакет принимает конфиг
+   // packages/api/src/index.ts
+   export const initApi = (config: ApiConfig) => { ... }
+
+   // ✅ Правильно — env разбирается в bootstrap приложения
+   // apps/workstation/src/app/bootstrap/index.ts
+   import { initApi } from '@cbs/api'
+   initApi({
+       baseUrl: import.meta.env.VITE_BASE_API_URL,
+       prefix: import.meta.env.VITE_API_PREFIX,
+   })
+   ```
+
+3. **`packages/entities` (Слой Entities)**
+   - **Что здесь:** Бизнес-сущности (User, Order, Client). Zod-схемы ответов, хуки TanStack Query (`useOrderQuery`), dumb-компоненты.
+   - **Мутации в entities — по критерию, не по типу операции:** Мутация живёт в `entities`, если одновременно выполняются все три условия: (а) операция над одной сущностью, (б) инвалидирует только свои queryKey, (в) не требует навигации, кастомного toast или UI-состояния после успеха. Во всех остальных случаях — `features`.
+   - **Зависимости:** Может импортировать из `@cbs/shared` и `@cbs/api`.
+
+4. **`packages/features` (Слой Features — Опционально)**
+   - **Что здесь:** Переиспользуемые пользовательские сценарии с побочными эффектами (оркестрация store, router, cross-entity логика).
+   - **Имя слайса — глагольная фраза:** Feature отвечает на вопрос «что делает пользователь?», поэтому её имя — действие, а не существительное. `login-by-personal-code`, `logout`, `accept-order` — правильно. `auth`, `order`, `client` — это зона entities, не features.
+   - **Критерий выноса в пакет:** Feature выносится в `packages/features`, если у неё общий контракт и основная часть сценария переиспользуется между приложениями, а app-specific различия можно изолировать адаптером или конфигурацией. Критерий "100% идентична" нежизнеспособен — достаточно substantial reuse.
+   - **Зависимости:** Может импортировать из `@cbs/shared`, `@cbs/api`, `@cbs/entities`.
+
+   **Именование feature-слайсов:**
+
+   | ❌ Существительное | ✅ Глагольная фраза               |
+   | :----------------- | :-------------------------------- |
+   | `features/auth`    | `features/login-by-personal-code` |
+   | `features/auth`    | `features/login-by-google`        |
+   | `features/auth`    | `features/logout`                 |
+   | `features/order`   | `features/accept-order`           |
+   | `features/client`  | `features/edit-client-data`       |
+   | `features/bonus`   | `features/manage-client-bonuses`  |
+
+   **Практический эффект:** исчезают коллизии имён между entity и feature — алиасы при импорте больше не нужны:
+
+   ```typescript
+   // ❌ До — коллизия вынуждает делать алиас
+   import { useLogoutMutation as useLogoutMutationEntity } from '@cbs/entities/auth'
+   import { useLogoutMutation } from '@cbs/features/auth'
+
+   // ✅ После — разные модули, разные имена, нет алиасов
+   import { useLogoutMutation } from '@cbs/entities/auth'
+   import { useLogout } from '@cbs/features/logout'
+   ```
+
+   **Именование хуков внутри feature:** хук называется по действию. Суффикс `Mutation`/`Query`
+   уместен только если хук является тонкой оберткой над TanStack. Если хук — это полноценный
+   сценарий с оркестрацией — суффикс опускается:
+
+   | ❌                              | ✅                       |
+   | :------------------------------ | :----------------------- |
+   | `useAuthByPersonalCode`         | `useLoginByPersonalCode` |
+   | `useLogoutMutation` (в feature) | `useLogout`              |
+   | `useInitiateGoogleAuthMutation` | `useInitiateGoogleAuth`  |
+
+### 🚀 Слои приложений (apps/\*)
+
+1. **`src/features` (Локальные фичи)**
+   - **Что здесь:** Пользовательские сценарии с побочными эффектами, специфичные для этого приложения.
+   - **Имя слайса** — глагольная фраза, как и в `packages/features` (см. выше).
+   - **Критерий:** Фича — это пользовательский сценарий, который может содержать UI, локальный state, мутации, оркестрацию. Мутации и write-операции живут здесь, а не в `entities`.
+
+2. **`src/widgets` (Слой Widgets)**
+
+   Виджет — это **самостоятельный экранный блок**, который владеет своей UI-композицией,
+   локальным состоянием и orchestration-логикой внутри блока. Виджет — единственный слой,
+   где встречаются данные нескольких сущностей или несколько фич в одном блоке.
+   Страница компонует виджеты — виджет компонует всё остальное.
+
+   **Критерий виджета** — выполняется хотя бы одно условие:
+   - агрегирует runtime-данные более чем одной сущности;
+   - компонует несколько features в единый экранный блок;
+   - содержит сложное внутреннее состояние, специфичное для этого экранного блока;
+   - представляет крупный самостоятельный экранный блок с собственной композицией,
+     жизненным циклом или режимами отображения — даже если работает вокруг одной сущности.
+
+   **Сегменты виджета:**
+   - `ui/` — внутренние под-компоненты, специфичные для этого виджета и не переиспользуемые
+     снаружи. Если под-компонент мог бы жить в `entities/ui` — он туда и должен уйти.
+   - `model/` — только при сложном состоянии, разделяемом между под-компонентами виджета
+     (Pinia store, многошаговый wizard). Простые `ref` остаются инлайн в компоненте виджета.
+   - `api/` — **запрещён**. Виджет не владеет transport-layer кодом. Данные приходят
+     только через публичные хуки нижележащих слоёв.
+
+   **Допустимо:**
+   - Вызов хуков данных из `entities` (`useQuery`).
+   - Локальный UI-state: открытые панели, активные табы, режимы отображения.
+   - UI-orchestration внутри блока: когда и что показать, как связать выбор с отображением.
+   - Передача данных вниз через props в dumb-компоненты и фичи.
+   - Мутации как исключение — только для мелких, tightly coupled widget-actions, которые
+     не образуют самостоятельный пользовательский сценарий и не переиспользуются
+     (dismiss уведомления, reset preference, сохранение порядка колонок).
+
+   **Запрещено:**
+   - Инкапсуляция самостоятельного доменного бизнес-сценария — это ответственность `features`.
+   - Импорт других виджетов — **по умолчанию запрещён**. Исключение: чистые layout/composition
+     блоки без бизнес-логики, где нижележащий виджет выступает как переиспользуемый
+     экранный блок, а не как самостоятельный сценарий. Такое исключение должно быть
+     явно обосновано на ревью.
+   - Прямые API-вызовы в обход публичных хуков `entities`.
+
+   **✅ Правильно:**
+
+   ```ts
+   <!-- apps/workstation/src/widgets/order-search-panel/OrderSearchPanel.vue -->
+   <script setup lang="ts">
+     /**
+      * Виджет, который агрегирует поиск заказов и управление клиентом в единый экранный блок.
+      */
+     import { ref, computed } from 'vue'
+     import { useGetOrderQuery } from '@cbs/entities/order'
+     import { useGetClientQuery } from '@cbs/entities/client'
+     import { SearchOrdersForm } from '@cbs/features/search-orders'
+     import { AcceptOrderButton } from '@/features/accept-order'
+     import { OrderResultsTable, ClientPreviewCard } from './ui'
+
+     // ─── local ui state ───────────────────────────────────────────────────
+     const selectedOrderId = ref<string | null>(null)
+
+     // ─── данные из entities ───────────────────────────────────────────────
+     const { data: order } = useGetOrderQuery(selectedOrderId)
+     const { data: client } = useGetClientQuery(computed(() => order.value?.clientId ?? null))
+
+     // ─── handlers ─────────────────────────────────────────────────────────
+     const handleOrderSelect = (id: string) => {
+       selectedOrderId.value = id
+     }
+   </script>
+
+   <template>
+     <SearchOrdersForm @select="handleOrderSelect" />
+     <OrderResultsTable :order="order" :client="client" />
+     <AcceptOrderButton v-if="selectedOrderId" :order-id="selectedOrderId" />
+   </template>
+   ```
+
+   **❌ Антипаттерны:**
+
+   ```ts
+   <script setup lang="ts">
+     // ❌ Доменный бизнес-сценарий в виджете — выносить в feature
+     const { mutate: processOrderRefund } = useProcessOrderRefundMutation()
+     const handleRefund = () => {
+       if (order.value.eligibleForRefund && client.value.hasActivePolicy) {
+         processOrderRefund({ orderId: order.value.id })
+       }
+     }
+
+     // ❌ Прямой API-вызов в обход entity-хука
+     const order = await apiClient.get(`/orders/${id}`)
+
+     // ❌ Импорт другого виджета без обоснования
+     import { ClientManagementPanel } from '@/widgets/client-management-panel'
+   </script>
+   ```
+
+   **Эвристика проверки:** если заменить любую feature внутри виджета на заглушку с тем же
+   публичным интерфейсом (props, emits) — виджет должен продолжить работу. Зависимость
+   от публичного контракта feature допустима. Зависимость от деталей её реализации — нет.
+
+3. **`src/pages` (Слой Pages)**
+
+   Страница — это **экран, привязанный к роуту**. Она отвечает за route-level composition:
+   скомпоновать виджеты, передать им нормализованные параметры и принять route-level решения.
+   Страница не инкапсулирует доменную бизнес-логику и не работает с сущностями напрямую
+   как владелец экранного сценария — но знает о роуте, правах доступа, feature flags
+   и о том, какие блоки экрана существуют.
+
+   **Сегменты страницы:**
+   - `ui/` — сам компонент страницы и его скелетон/заглушки.
+   - `model/` — только route-уровневое состояние: нормализация params, feature flags,
+     access guards. Без доменной логики.
+   - `api/` — **запрещён**. Страница не владеет transport-layer кодом.
+
+   **Допустимо:**
+   - Чтение и нормализация `route.params` / `route.query`.
+   - Передача нормализованных params в виджеты через props.
+   - Access guards и feature flag checks (показать/скрыть виджет).
+   - SEO/meta setup (`useHead`).
+   - Route-driven branching — какие виджеты рендерить в зависимости от роута.
+   - `useQuery` / prefetch как исключение — только для route-level orchestration:
+     SSR (`onServerPrefetch`), access resolution на основе данных, route-bound resource loading,
+     от которого зависит сама композиция экрана.
+
+   **Запрещено:**
+   - `useMutation` на уровне страницы — мутации живут в `features`.
+   - Доменная бизнес-логика и условия на основе полей сущностей.
+   - Локальный state, не связанный с роутом — это ответственность виджетов.
+   - Знание о сети: прямые вызовы API-функций.
+
+   **✅ Правильно:**
+
+   ```ts
+   <!-- apps/workstation/src/pages/orders/OrdersPage.vue -->
+   <script setup lang="ts">
+     /**
+      * Страница, которая отображает экран поиска и управления заказами.
+      */
+     import { computed } from 'vue'
+     import { useRoute } from 'vue-router'
+     import { useAuthStore } from '@cbs/entities/auth'
+     import { ClientManagementPanel, OrderSearchPanel } from '@/widgets'
+
+     // ─── route params ──────────────────────────────────────────────────────
+     const route = useRoute()
+     const orderId = computed(() => {
+       const raw = route.query.orderId
+       return typeof raw === 'string' && raw.length > 0 ? raw : null
+     })
+
+     // ─── access guards ─────────────────────────────────────────────────────
+     const authStore = useAuthStore()
+     const canManageClients = computed(() => authStore.hasPermission('clients:write'))
+   </script>
+
+   <template>
+     <OrderSearchPanel />
+     <ClientManagementPanel v-if="orderId && canManageClients" :order-id="orderId" />
+   </template>
+   ```
+
+   **❌ Антипаттерны:**
+
+   ```ts
+   <script setup lang="ts">
+     // ❌ useMutation на уровне страницы — только в features
+     const { mutate: acceptOrder } = useAcceptOrderMutation()
+
+     // ❌ useQuery без route-level необходимости — данные должны быть в виджете
+     const { data: order } = useGetOrderByIdQuery(orderId)
+
+     // ❌ Доменная логика на основе данных сущности
+     const showBonusPanel = computed(
+       () => order.value?.status === 'active' && order.value?.client.bonusBalance > 0,
+     )
+
+     // ❌ UI-состояние виджета, поднятое на уровень страницы
+     const isSearchPanelExpanded = ref(false)
+   </script>
+   ```
+
+   **Эвристика проверки:** если мысленно убрать компонент страницы и подключить виджеты
+   напрямую в роутере — поведение приложения не должно измениться. Если что-то ломается —
+   страница делала слишком много.
+
+4. **`src/app` (Слой App)**
+   - **Что здесь:** Точка входа и сборка приложения.
+
+   ```ts
+   src/app/
+     providers/    — Vue Query Plugin, глобальные контексты, Error Boundaries
+     router/       — определение роутов, guards
+     styles/       — глобальные стили, Tailwind-конфиг
+     bootstrap/    — инициализация (initApi, i18n и т.д.)
+   ```
+
+   - **Правило:** `app` не содержит бизнес-логики. Он только собирает и инициализирует.
+
+---
+
+## 3. Золотые правила hFSD
+
+### Правило №1: Однонаправленный поток зависимостей
+
+Модуль может импортировать только те модули, которые находятся на слоях **строго ниже** него.
+
+✅ **Правильно:**
+
+- `Page` импортирует `Widget` и `Feature`.
+- `Widget` импортирует `Feature` и `Entity`.
+- `Feature` импортирует `Entity`, `Shared`, `Api`.
+- `Entity` импортирует `Shared`, `Api`.
+
+❌ **ЗАПРЕЩЕНО (Фатальная ошибка):**
+
+- `packages/entities` импортирует что-то из `packages/features`.
+- `packages/shared` импортирует `packages/entities`.
+- `Page` вызывает `useMutation` напрямую — мутации только в `features`.
+
+### Правило №2: Изоляция слайсов (No Cross-imports)
+
+Модули на **одном слое** не импортируют друг друга напрямую.
+
+- ❌ `features/login-by-personal-code` импортирует `features/logout` — запрещено.
+- ❌ `widgets/OrderInformation` импортирует `widgets/OrderCard` — запрещено.
+- **Как решать:** Если нужна композиция — либо поднять общую часть в `shared/ui` (если без домена), либо переосмыслить декомпозицию (см. §4 паттерн dumb-компонента).
+
+**Исключение для `entities`:** Разрешён `type-only` импорт публичного типа другой сущности через её `index.ts`. Это решает только задачу **моделирования типов** — когда тип одной сущности является полем другой. Runtime-зависимости между entities запрещены.
+
+```ts
+// ✅ Разрешено — тип Client как поле модели Order
+// packages/entities/order/model/order.types.ts
+import type { Client } from '@cbs/entities/client'
+
+export type Order = {
+  id: string
+  client: Client // тип клиента как часть модели заказа
+}
+
+// ❌ Запрещено — runtime-логика между entities
+import { useClientQuery } from '@cbs/entities/client'
+
+// ❌ Запрещено — обход index.ts
+import { clientMapper } from '@cbs/entities/client/model/mappers'
+```
+
+**Важно:** `type-only` импорт не решает задачу отображения данных нескольких сущностей вместе — это задача для `widgets` (см. §4).
+
+### Правило №3: Публичный API (index.ts)
+
+Каждый слайс обязан иметь `index.ts`. Это его единственная точка входа.
+
+```ts
+// ✅ Правильно — через публичный API
+import { useOrderQuery, OrderSchema } from '@cbs/entities/order'
+
+// ❌ Запрещено — обход публичного API
+import { orderMapper } from '@cbs/entities/order/model/order.mapper'
+```
+
+---
+
+## 4. Ключевые паттерны
+
+### Паттерн: Dumb-компонент vs Виджет
+
+**Главный вопрос:** компонент **знает и достаёт** данные или **получает и показывает**?
+
+- **Достаёт данные** (вызывает хуки) → виджет, живёт в `src/widgets`.
+- **Получает через props** (только рендерит) → dumb-компонент, живёт в `entities/ui`.
+
+Это разграничение решает проблему "виджет внутри виджета": если нужна вложенная композиция — скорее всего, внутренний компонент на самом деле является dumb-компонентом и должен жить в `entities/ui`.
+
+---
+
+### Паттерн: Агрегация нескольких сущностей (OrderCard + OrderInformation)
+
+**Задача:** Показать карточку заказа, которая отображает данные `Order` и `Client` вместе.
+
+**❌ Неправильно — entity агрегирует runtime-данные другой entity:**
+
+```ts
+<!-- packages/entities/order/ui/OrderCard.vue -->
+<script setup lang="ts">
+  // Нарушение: entity вызывает хук другой entity
+  const { data: client } = useClientQuery(props.order.clientId)
+</script>
+```
+
+**✅ Правильно — два уровня:**
+
+```ts
+<!-- packages/entities/order/ui/OrderCard.vue — dumb-компонент -->
+<script setup lang="ts">
+  /**
+   * Компонент, который отображает карточку заказа с данными клиента.
+   */
+  defineProps<{
+    order: Order
+    client: Client
+  }>()
+  // Никаких хуков — только props и рендер
+</script>
+
+<template>
+  <div>
+    <p>{{ order.number }}</p>
+    <p>{{ client.name }}</p>
+  </div>
+</template>
+```
+
+```ts
+<!-- apps/workstation/src/widgets/order-information/OrderInformation.vue — виджет -->
+<script setup lang="ts">
+  /**
+   * Виджет, который агрегирует данные заказа и клиента для отображения.
+   */
+  const props = defineProps<{ orderId: string }>()
+
+  // Виджет — единственный кто знает о двух сущностях
+  const { data: order } = useOrderQuery(props.orderId)
+  const { data: client } = useClientQuery(order.value?.clientId)
+</script>
+
+<template>
+  <!-- Данные получены — прокидываем вниз через props -->
+  <OrderCard :order="order" :client="client" />
+</template>
+```
+
+**Почему так:**
+
+- `OrderCard` — переиспользуемый, легко тестируется, не зависит от источника данных.
+- `OrderInformation` — единственная точка ответственности за агрегацию, виджет по определению.
+- Запрет `widget → widget` не нарушается: `OrderCard` живёт в `entities/ui`, не в `widgets`.
+
+---
+
+### Паттерн: Хуки TanStack Query и архитектура
+
+TanStack Query рекомендует вызывать хуки "максимально близко к использованию". Эта рекомендация касается **кэширования**, а не архитектуры компонентов: не тащи данные в глобальный стор если они нужны только локально.
+
+Наш подход не противоречит этому:
+
+- `OrderInformation` (виджет) — ближайший общий родитель для всех компонентов, которым нужны эти данные. Это и есть "максимально близко".
+- TanStack Query кэширует результат по ключу — если `useOrderQuery('123')` вызван в нескольких местах, сетевой запрос будет один.
+
+```ts
+❌ Что критикует документация TQ:
+App → fetchOrder() → Pinia store → OrderCard  // глобальный стор без необходимости
+
+✅ Что рекомендует TQ (и что делаем мы):
+OrderInformation → useOrderQuery() → данные в TQ кэше → props вниз
+```
+
+**Правило:** Хуки данных вызываются как можно **выше** в дереве — там где принимается решение что показывать. Вниз летят только данные через props.
+
+---
+
+## 5. Табу и частые ошибки
+
+- 🚫 **Shared знает о бизнесе:** Бизнес-маперы или домен-специфичная логика в `packages/shared`.
+- 🚫 **`packages/api` читает `VITE_*` напрямую:** Пакет принимает конфиг через `initApi(config)`. Разбор env — в `app/bootstrap`.
+- 🚫 **Мутации не по критерию в `entities`:** Если мутация инвалидирует чужие queryKey, требует навигации после успеха, кастомного toast или оркестрации нескольких запросов — она принадлежит `features`, независимо от того, над какой сущностью работает.
+- 🚫 **Feature названа существительным:** `features/auth`, `features/order`, `features/client` — это коллизия с entity-слоем. Feature отвечает на вопрос «что делает пользователь?», entity — «что существует в домене?». Имя feature — всегда глагольная фраза.
+- 🚫 **Виджет импортирует виджет:** Если кажется что нужен `widget → widget` — скорее всего внутренний компонент является dumb-компонентом и должен жить в `entities/ui`.
+- 🚫 **Хуки данных в dumb-компонентах:** Если компонент вызывает `useQuery` — он не dumb. Данные должны приходить через props.
+- 🚫 **Спагетти в pages:** Мутации и доменная бизнес-логика в страницах. Pages управляют экраном и роутом, не доменом.
+- 🚫 **Игнорирование `index.ts`:** Импорт внутренностей модуля в обход публичного API.
+- 🚫 **Runtime-связи между `entities`:** `type-only` через `index.ts` — разрешено. Импорт хуков или логики — запрещён.

@@ -1,0 +1,429 @@
+---
+description: 'Стандарт Vue-компонентов: порядок блоков в script setup, computed, доменные строки, DOM-зависимости и placeholder-код'
+globs:
+    - 'apps/**/src/**/*.vue'
+    - 'packages/**/src/**/*.vue'
+---
+
+# 🟢 Стандарт Vue-компонентов (CBS)
+
+Этот документ задаёт **сильные дефолты** для Vue-компонентов. Его цель — не запретить отдельные синтаксические приёмы сами по себе, а сократить три класса проблем:
+
+- лишнюю реактивную прослойку без новой семантики;
+- строковые доменные значения без единого контракта;
+- хрупкие зависимости логики от DOM-структуры и CSS-классов;
+- placeholder-код, который попадает в merge-ready ветку без явной трассировки.
+
+Если отклонение от правила делает код **заметно понятнее, устойчивее и проще в сопровождении**, оно допустимо. Но такое отклонение должно быть осознанным и локально объяснимым на ревью.
+
+---
+
+## 1. Порядок блоков в `<script setup>`
+
+### Эталонный порядок
+
+```text
+1. imports                  — внешние зависимости и модули
+2. defineProps / defineEmits — публичный контракт компонента
+3. store / composables      — внешние хранилища и логика
+4. refs                     — локальное состояние (ref, reactive)
+5. computed                 — производные значения с семантической ценностью
+6. watchers                 — реакция на изменения (watch, watchEffect)
+7. handlers                 — методы взаимодействия (handle*, on*)
+8. helpers                  — вспомогательные приватные функции
+```
+
+**ВАЖНО!** — При отсутствии комментариев добавлять комментарии, которые разделяют границы между вышеперечисленными пунктами
+
+### Правило про helpers
+
+**Pure-функции** — без side effects, без обращения к `ref`, `props`, `store`, `inject`, `router`, DOM и реактивным данным — выносятся **за пределы компонента**: перед `<script setup>` или в `@cbs/shared/lib`.
+
+**Impure-функции** — обращаются к реактивным данным, DOM, внешним сторам или вызывают side effects — остаются внутри компонента в блоке `helpers` в самом конце.
+
+```ts
+// ✅ Pure — вне компонента, перед <script setup> или в shared/lib
+const formatPrice = (price: number) => price.toLocaleString('ru-RU')
+const formatUnitNumber = (id: number | null) => String(id ?? '')
+```
+
+### Эталонный пример
+
+```vue
+<script setup lang="ts">
+    // Pure-утилита — вне компонента
+    const formatPrice = (price: number) => price.toLocaleString('ru-RU')
+
+    // ─── 1. imports ───────────────────────────────────────────────
+    import { computed, ref, watch, nextTick } from 'vue'
+    import type { ProductionUnit } from '@cbs/entities/production-unit'
+    import { PRODUCTION_UNIT_STATE } from '@cbs/entities/production-unit'
+    import { useOrderStore } from '@cbs/entities/order'
+
+    // ─── 2. defineProps / defineEmits ─────────────────────────────
+    interface Props {
+        productionUnit: ProductionUnit
+        isSelected?: boolean
+        orderId?: number
+    }
+    interface Emits {
+        select: [id: number]
+    }
+    const props = withDefaults(defineProps<Props>(), {
+        isSelected: false,
+        orderId: undefined,
+    })
+    const emit = defineEmits<Emits>()
+
+    // ─── 3. store / composables ───────────────────────────────────
+    const orderStore = useOrderStore()
+
+    // ─── 4. refs ──────────────────────────────────────────────────
+    const containerRef = ref<HTMLElement>()
+    const isPopoverVisible = ref(false)
+    const isTruncated = ref(false)
+
+    // ─── 5. computed ──────────────────────────────────────────────
+    const priceDisplay = computed(() => {
+        const { state, finalPrice } = props.productionUnit
+        if (state === PRODUCTION_UNIT_STATE.Cancelled) return 'отмена'
+        if (state === PRODUCTION_UNIT_STATE.Returned) return 'возврат'
+        return formatPrice(finalPrice ?? 0)
+    })
+
+    const statusColor = computed(() => {
+        const { state, finalPrice } = props.productionUnit
+        if (state === PRODUCTION_UNIT_STATE.Cancelled || state === PRODUCTION_UNIT_STATE.Returned)
+            return 'bg-grey-400'
+        return (finalPrice ?? 0) === 0 ? 'bg-green-600' : 'bg-red-400'
+    })
+
+    const validOrderId = computed(() => {
+        const id = props.orderId ?? props.productionUnit.orderId
+        return id && id > 0 && Number.isFinite(id) ? id : null
+    })
+
+    // ─── 6. watchers ──────────────────────────────────────────────
+    watch(
+        () => props.productionUnit.name,
+        () => checkTruncation(),
+        { immediate: true },
+    )
+
+    // ─── 7. handlers ──────────────────────────────────────────────
+    const handleSelect = () => {
+        emit('select', props.productionUnit.id)
+    }
+
+    const handleCopy = async () => {
+        await navigator.clipboard.writeText(String(props.productionUnit.id))
+    }
+
+    // ─── 8. helpers (impure) ──────────────────────────────────────
+    const checkTruncation = () => {
+        nextTick(() => {
+            isTruncated.value = containerRef.value
+                ? containerRef.value.scrollWidth > containerRef.value.clientWidth
+                : false
+        })
+    }
+</script>
+```
+
+---
+
+## 2. Правило `computed`
+
+`computed` — это не просто кэш. Это способ **выразить намерение**, дать имя derived value и упростить чтение шаблона или скрипта.
+
+Правильный вопрос на ревью не "сколько тут источников?", а:
+
+> Этот `computed` создаёт новую семантику, уменьшает дублирование или заметно упрощает код?
+
+### Когда `computed` рекомендуется
+
+`computed` оправдан, если выполняется хотя бы одно условие:
+
+- комбинируются несколько источников данных;
+- есть нетривиальная логика с несколькими условиями или ветвлением;
+- вычисление получает осмысленное имя и тем самым выражает намерение;
+- результат используется повторно в шаблоне или в скрипте;
+- вычисление скрывает форматирование или преобразование, которое заметно засоряет шаблон;
+- вызывается функция, результат которой разумно кэшировать.
+
+#### Presentation computed
+
+Скрывает форматирование и представление. Нормален, если даёт смысловое имя или уменьшает шум.
+
+```ts
+// ✅ Presentation computed — скрывает форматирование, даёт имя
+const displayName = computed(() => props.user.name || '—')
+const formattedPrice = computed(() =>
+    (props.productionUnit.finalPrice ?? 0).toLocaleString('ru-RU'),
+)
+const badgeLabel = computed(() => (props.isActive ? 'Активен' : 'Неактивен'))
+```
+
+#### Business computed
+
+Выражает доменную логику. Оправдан почти всегда.
+
+```ts
+// ✅ Business computed — сложная логика, смысловое имя
+const isArchivedAndLockedForEdit = computed(() => props.order.isArchived && !props.order.canEdit)
+
+// ✅ Комбинирует несколько источников
+const validOrderId = computed(() => {
+    const id = props.orderId ?? props.productionUnit.orderId
+    return id && id > 0 && Number.isFinite(id) ? id : null
+})
+```
+
+### Когда `computed` обычно не нужен
+
+`computed` не рекомендуется, если он:
+
+- механически оборачивает один `prop` или простое выражение без нового смыслового имени;
+- используется как алиас “для красоты”;
+- не упрощает шаблон и не переиспользуется;
+- не скрывает вычисление, которое действительно стоит вынести.
+
+```ts
+// ❌ Нет новой семантики — просто алиас с приведением типа
+const unitNumber = computed(() => String(props.productionUnit.id ?? ''))
+
+// ❌ Нет новой семантики — простой аксессор с коалесцингом
+const finalPrice = computed(() => props.productionUnit.finalPrice ?? 0)
+```
+
+```vue
+<!-- ✅ Для простых случаев — прямо в шаблоне -->
+{{ String(productionUnit.id ?? '') }}
+{{ productionUnit.finalPrice ?? 0 }}
+```
+
+### Балансирующий принцип
+
+Если выражение **ухудшает читаемость шаблона**, выносить его в `computed` оправдано, даже если формально оно "простое":
+
+```vue
+<!-- ❌ Тернарники в шаблоне — хуже computed -->
+{{
+    productionUnit.state === PRODUCTION_UNIT_STATE.Cancelled
+        ? 'отмена'
+        : productionUnit.state === PRODUCTION_UNIT_STATE.Returned
+          ? 'возврат'
+          : (productionUnit.finalPrice ?? 0).toLocaleString('ru-RU')
+}}
+
+<!-- ✅ Вынести в priceDisplay computed — шаблон чище -->
+{{ priceDisplay }}
+```
+
+### Число использований — эвристика, не правило
+
+"Использую три раза — значит нужен `computed`" — ненадёжный критерий. Смысловое имя и упрощение шаблона важнее счётчика.
+
+---
+
+## 3. Правило доменных строк
+
+Строковые литералы, которые являются **частью доменного контракта**, не должны быть размазаны по компоненту, шаблону и соседним файлам. Такие значения выносятся в константы, enum или `as const`-словари.
+
+Это касается прежде всего:
+
+- статусов;
+- типов сущностей;
+- кодов режимов;
+- значений, приходящих с API;
+- строк, участвующих в условиях, ветвлении и бизнес-проверках.
+
+### Как различать
+
+| Тип               | Примеры                                            | Что делать                                  |
+| ----------------- | -------------------------------------------------- | ------------------------------------------- |
+| Доменное значение | `'cancelled'`, `'returned'`, `'phone'`, `'order'`  | Вынести в константу/enum                    |
+| UI-строка         | `'Название не указано'`, `'отмена'`, `'Подробнее'` | Оставить в шаблоне, если в проекте нет i18n |
+
+### Доменные значения → константы
+
+```ts
+// entities/production-unit/model/production-unit.const.ts
+export const PRODUCTION_UNIT_STATE = {
+    Cancelled: 'cancelled',
+    Returned: 'returned',
+    Active: 'active',
+} as const
+
+export type ProductionUnitState = (typeof PRODUCTION_UNIT_STATE)[keyof typeof PRODUCTION_UNIT_STATE]
+```
+
+```ts
+// ✅ Использование в computed
+import { PRODUCTION_UNIT_STATE } from '../model/production-unit.const'
+
+const priceDisplay = computed(() => {
+    const { state, finalPrice } = props.productionUnit
+    if (state === PRODUCTION_UNIT_STATE.Cancelled) return 'отмена'
+    if (state === PRODUCTION_UNIT_STATE.Returned) return 'возврат'
+    return (finalPrice ?? 0).toLocaleString('ru-RU')
+})
+```
+
+```vue
+<!-- ✅ Доменное значение через константу -->
+<span v-if="productionUnit.state !== PRODUCTION_UNIT_STATE.Cancelled">₽</span>
+
+<!-- ✅ UI-строка — нормально без константы -->
+{{ productionUnit.name || 'Название не указано' }}
+```
+
+### Антипаттерн
+
+```ts
+// ❌ Одно доменное значение в нескольких местах — источник рассинхронизации
+if (props.productionUnit.state === 'cancelled') {
+    // ...
+}
+```
+
+```vue
+<!-- ❌ Доменная строка захардкожена в шаблоне -->
+<span v-if="productionUnit.state !== 'cancelled'">₽</span>
+```
+
+### Важно
+
+Нужно различать **доменные значения** и **обычные UI-строки**.
+
+- `cancelled`, `returned`, `order` — это доменный контракт, их надо выносить.
+- `Название не указано`, `Ошибка загрузки`, `Сохранить` — это UI-текст. Он не обязан становиться константой только из-за того, что это строка.
+
+Если проект использует i18n, UI-строки подчиняются правилам локализации.
+
+---
+
+## 4. Правило DOM-зависимостей
+
+Компонент не должен зависеть от своего DOM-окружения **неявно**. Плохо не только искать по CSS-классу — плохо любое предположение о структуре родителя или дерева без явного контракта.
+
+### Что запрещено по умолчанию
+
+```ts
+// ❌ Поиск по CSS-классу — сломается, если класс уберут
+const parentRect = (event.currentTarget as HTMLElement)
+    .closest('.relative')
+    ?.getBoundingClientRect()
+
+// ❌ Поиск по структуре DOM вверх/вниз без контракта
+el.parentElement?.parentElement?.querySelector('.popover-anchor')
+```
+
+### Правило
+
+> Если компоненту нужен конкретный DOM-узел для поведения, позиционирования или измерений, зависимость должна быть явной: через `ref`, `expose`, anchor-элемент или специализированный positioning API.
+
+### Правильные альтернативы
+
+#### Вариант А — явный `ref` на контейнер
+
+```ts
+// ✅ ref — явная связь, не зависит от CSS-классов
+const containerRef = ref<HTMLElement>()
+
+const handleAttributesClick = (event: MouseEvent) => {
+    const parentRect = containerRef.value?.getBoundingClientRect()
+    const rect = (event.target as HTMLElement).getBoundingClientRect()
+}
+```
+
+```vue
+<div ref="containerRef">
+    <ProductionUnitAttributes @click="handleAttributesClick" />
+</div>
+```
+
+#### Вариант Б — Floating UI для popover и tooltip
+
+```ts
+// ✅ Floating UI — позиционирование через явный anchor, без DOM-поиска
+import { useFloating, offset, flip } from '@floating-ui/vue'
+
+const { floatingStyles } = useFloating(referenceRef, floatingRef, {
+    middleware: [offset(10), flip()],
+})
+```
+
+### Допустимые исключения
+
+Низкоуровневые интеграции с внешними библиотеками, legacy-кодом или third-party DOM API могут требовать `querySelector`, `.closest()` или похожие вызовы. В таких случаях зависимость должна быть:
+
+- максимально локализована;
+- не размазана по компоненту;
+- объяснима на ревью;
+- по возможности обёрнута в адаптер/helper.
+
+Но для обычного компонентного кода это не должно быть дефолтом.
+
+---
+
+## 5. Правило placeholder-кода и мёртвого кода
+
+Это правило применяется к **merge-ready коду в основной ветке**. Для локальных прототипов, spike-веток и промежуточной экспериментальной разработки требования могут быть мягче, но такой код не должен незаметно попадать в основной поток разработки.
+
+Пустой обработчик, временная кнопка или `@todo` допустимы только если одновременно выполняются оба условия:
+
+1. пользователь не может активировать незавершённое действие;
+2. незавершённость привязана к задаче в трекере.
+
+```ts
+// ❌ @todo без ссылки — непонятно когда и кем будет реализовано
+/** @todo Реализовать показ подробной информации о ПЕ */
+const handleShowDetails = () => {}
+
+// ✅ С ссылкой на задачу
+/** @todo CBS-1234 — показ подробной информации о ПЕ */
+const handleShowDetails = () => {}
+```
+
+```vue
+<!-- ✅ Пользователь не может активировать незавершённое действие -->
+<BaseButton disabled>
+    Показать детали
+</BaseButton>
+```
+
+### Практическое правило
+
+Если задачи нет, нужно сделать одно из двух:
+
+- удалить placeholder из merge-ready кода;
+- завести задачу и сослаться на неё явно.
+
+---
+
+## Короткая версия для ревью
+
+### `computed`
+
+Используем `computed`, когда он:
+
+- выражает смысл;
+- комбинирует данные;
+- уменьшает дублирование;
+- упрощает шаблон;
+- кэширует нетривиальное вычисление.
+
+Не используем, когда это просто алиас без новой семантики.
+
+### Доменные строки
+
+Доменные литералы не дублируем строками в шаблоне и скрипте. Выносим в константы или типизированные словари.
+
+### DOM
+
+Не строим логику на `.closest()` и неявной DOM-структуре. Нужен узел — получаем его явно через `ref` или специализированный API.
+
+### Placeholder-код
+
+Временный код допустим только если он недоступен пользователю и привязан к задаче.

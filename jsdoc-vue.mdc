@@ -1,0 +1,33 @@
+---
+description: 'JSDoc для Vue-компонентов: props, emits, порядок тегов'
+globs:
+    - 'apps/**/src/**/*.vue'
+---
+
+# 🟢 JSDoc Vue Standard
+
+Расширяет `jsdoc-core`. Применяется ко всем `.vue` файлам.
+
+## Требования
+
+- **Порядок тегов файла**: `<script>` → `<template>` → `<style>`.
+- **Описание компонента**: JSDoc-блок в самом начале `<script setup>` — до `defineProps`.
+- **Порядок тегов JSDoc**: `@description` → `@prop` → `@emit`.
+- Необязательные пропсы документируются с дефолтом: `@prop {boolean} [loading=false]`.
+
+## Пример
+
+```vue
+<script setup lang="ts">
+    /**
+     * Кнопка с индикатором загрузки.
+     * @description Используется для подтверждения форм. Блокирует повторный клик
+     *              во время выполнения асинхронного действия.
+     * @prop {string} label - Текст кнопки.
+     * @prop {boolean} [loading=false] - Показывает спиннер и блокирует клик.
+     * @emit {void} click - Пользователь кликнул по активной кнопке.
+     */
+    const props = defineProps<{ label: string; loading?: boolean }>()
+    const emit = defineEmits<{ click: [] }>()
+</script>
+```

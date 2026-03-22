@@ -1,0 +1,131 @@
+---
+description: 'Testing Standard: TDD workflow (Red-Green-Refactor); Vitest for unit/integration tests; use @vue/test-utils; follow FSD boundaries; mock API via vi.mock().'
+alwaysApply: false
+globs:
+  - "**/*.{spec,test}.ts"
+  - "**/__tests__/**/*"
+---
+
+# 🧪 Архитектурный стандарт: Тестирование (TDD & Vitest)
+
+## 1. Рабочий процесс TDD (Red-Green-Refactor)
+
+При получении задачи на создание логики или компонента, необходимо:
+
+1. **Red**: Создать файл `[name].spec.ts` рядом с кодом и описать тесты для ожидаемого поведения.
+2. **Green**: Написать минимально необходимый код, чтобы тесты прошли.
+3. **Refactor**: Улучшить код, сохраняя работоспособность тестов.
+
+## 2. Инструментарий
+
+- **Framework**: Vitest.
+- **UI Testing**: `@vue/test-utils` для Vue компонентов.
+- **Mocks**: Необходимо использовать `vi.mock()` для изоляции внешних зависимостей (API, Store).
+
+## 3. Правила тестирования по слоям FSD
+
+- **Shared UI**: Необходимо тестировать пропсы, события (emit) и слоты. Не тестировать бизнес-логику.
+- **Entities/Features**: Необходимо тестировать хуки (TanStack Query) и мапперы Zod. Обязательно проверять негативные сценарии (ошибки API).
+- **Mocks**: API-запросы должны мокаться на уровне `packages/api` или через перехватчики.
+
+## 4. Пример структуры теста
+
+```typescript
+import { mount } from '@vue/test-utils'
+import { describe, it, expect, vi } from 'vitest'
+import MyComponent from './MyComponent.vue'
+
+describe('MyComponent', () => {
+    it('should render correctly with given props', () => {
+        const wrapper = mount(MyComponent, { props: { title: 'Test' } })
+        expect(wrapper.text()).toContain('Test')
+    })
+})
+```
+
+## 5. Тестирование TanStack Query (Entities/API)
+
+При тестировании кастомных хуков (например, useGetClientByIdQuery), фокус должен быть на состояниях data, isLoading и error.
+
+- **Wrapper**: Необходимо всегда использовать QueryClientProvider в тестах хуков.
+- **Успешный кейс**: Необходимо мокать API функцию и проверять, что хук возвращает данные.
+- **Кейс с ошибкой**: Необходимо проверять, что хук корректно обрабатывает 404 или 500 ошибки.
+
+Пример: `useGetClient.spec.ts`
+
+```typescript
+import { renderHook, waitFor } from '@testing-library/vue'
+import { createQueryClientWrapper } from '@/shared/lib/test-utils'
+import { useGetClient } from './useGetClient'
+import { clientApi } from '../api/clientApi'
+
+vi.mock('../api/clientApi')
+
+describe('useGetClient', () => {
+    it('should return client data on success', async () => {
+        const mockClient = { id: 1, name: 'Ivan' }
+        vi.mocked(clientApi.getClientById).mockResolvedValue(mockClient)
+
+        const { result } = renderHook(() => useGetClient(1), {
+            wrapper: createQueryClientWrapper()
+        })
+
+        await waitFor(() => expect(result.value.isSuccess).toBe(true))
+        expect(result.value.data).toEqual(mockClient)
+    })
+})
+```
+
+## 6. Тестирование TanStack Form & Zod (Features)
+
+Тесты форм должны проверять не только UI, но и логику валидации и маппинг ошибок с бэкенда.
+
+- **Валидация**: Необходимо проверять, что форма не отправляется при невалидных данных (согласно Zod схеме).
+- **Маппинг ошибок (422)**: Необходимо тестировать, что ошибки с бэкенда корректно отображаются в соответствующих полях через setFieldMeta.
+- **Трансформации**: Если в схеме есть .transform() или .nullish(), тесты должны подтверждать корректность преобразования данных перед отправкой.
+
+Пример: `ClientEditForm.spec.ts`
+
+```typescript
+describe('ClientEditForm', () => {
+    it('should show server error message on 422 response', async () => {
+        const wrapper = mount(ClientEditForm)
+        const mutationError = { response: { status: 422, data: { errors: { email: ['Email already taken'] } } } }
+
+        /** Симулируем ошибку мутации в handleSubmit */
+        await wrapper.find('form').trigger('submit')
+
+        /** Проверяем, что ошибка "приземлилась" в метаданные поля */
+        expect(wrapper.find('.error-message').text()).toContain('Email already taken')
+    })
+})
+```
+
+## 7. Эталоны Моков (Mocks & Stores)
+
+- **Pinia**: Необходимо использовать createTestingPinia({ stubActions: false }), чтобы иметь возможность тестировать реальное изменение стейта при вызове экшенов.
+- **LocalStorage**: Если логика завязана на персистентность, необходимо мокать глобальный localStorage через vi.stubGlobal.
+- **WebSocket/Centrifugo**: Необходимо мокать шину событий, чтобы проверять реакцию UI на внешние пуши.
+
+### 🛠 Использование Test Utils
+
+При тестировании хуков и компонентов необходимо всегда использовать `createQueryClientWrapper` из `@/shared/lib/test-utils`.
+
+**Пример для хуков:**
+
+```typescript
+import { renderHook } from '@testing-library/vue'
+import { createQueryClientWrapper } from '@/shared/lib/test-utils'
+
+const { wrapper } = createQueryClientWrapper()
+const { result } = renderHook(() => useMyHook(), { wrapper })
+```
+
+## 8. Чек-лист для AI перед написанием кода
+
+1. **Проанализировать зависимости**: Какие API методы вызываются? (Нужен vi.mock).
+2. **Определить граничные условия**: Что если API вернет пустой массив? Что если телефон содержит 10 цифр вместо 11?
+3. **Подготовить данные**: Создать factory для сущности (например, createMockClient()), чтобы тесты были чистыми.
+4. **Запустить цикл**: Сначала пустой тест (Red) → Код → Прохождение теста (Green).
+
+## 8. Главное правило - не подстраивать тесты под код! Если есть какие-то расхождения, то следует остановиться и уведомить пользователя об этом

@@ -1,0 +1,49 @@
+---
+description: 'Form Standard: TanStack Form with Vue 3; integration with Zod schemas; use [Action][Entity]RequestSchema; reactivity via field.state.value; zodValidator adapter.'
+alwaysApply: false
+globs:
+  - "**/*Form.vue"
+  - "**/features/**/ui/*.vue"
+---
+
+# 📝 Архитектурный стандарт: Формы (TanStack Form)
+
+## 1. Интеграция с Zod
+
+- Для валидации форм необходимо использовать только `zodValidator` из `@tanstack/zod-form-adapter`.
+- Схемы должны соответствовать стандарту `[Action][Entity]RequestSchema`.
+
+## 2. Специфика Vue Реактивности
+
+- Необходимо использовать `useForm` для инициализации.
+- Доступ к значению поля в шаблоне осуществляется через `field.state.value`.
+- **Важно**: Необходимо всегда определять `defaultValues`, чтобы избежать проблем с `undefined` в реактивных полях.
+
+## 3. Эталонная реализация
+
+```vue
+<script setup lang="ts">
+    import { useForm } from '@tanstack/vue-form'
+    import { zodValidator } from '@tanstack/zod-form-adapter'
+    import { UpdateOrderRequestSchema } from '@/entities/order'
+
+    const form = useForm({
+        defaultValues: { amount: 0 },
+        validatorAdapter: zodValidator(),
+        validators: { onChange: UpdateOrderRequestSchema },
+        onSubmit: ({ value }) => {
+            /* логика мутации */
+        },
+    })
+</script>
+
+<template>
+    <form.Field name="amount" v-slot="{ field }">
+        <input
+            :value="field.state.value"
+            @input="e => field.handleChange((e.target as HTMLInputElement).value)"
+        />
+        <em v-if="field.state.meta.errors.length">{{ field.state.meta.errors.join(', ') }}</em>
+    </form.Field>
+</template>
+```

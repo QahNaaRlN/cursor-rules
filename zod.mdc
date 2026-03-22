@@ -1,0 +1,214 @@
+---
+description: "Zod standard: boundary-of-trust validation only, FSD-aware naming [SliceName][Entity]Schema, z.infer/z.input/z.output, Payload suffix for z.output, no ApiDto, no humps, no 'as Type', z.coerce, .transform() for key mapping."
+alwaysApply: false
+globs:
+    - '**/*.schema.ts'
+    - '**/{schemas,api}/**/*.ts'
+---
+
+# Архитектурный стандарт: Zod для валидации и маппинга данных
+
+## 1. Философия: Zod как "Граница доверия" (Boundary of Trust)
+
+Zod используется для любых **runtime-непроверенных данных на границах доверия**:
+
+- Ответы API (парсинг и трансформация snake_case → camelCase)
+- Тела запросов (валидация и трансформация camelCase → snake_case)
+- Формы (валидация пользовательского ввода)
+- `localStorage` / `sessionStorage`
+- URL-параметры и query string
+- Переменные окружения и внешние конфиги
+- Feature flags и CMS-контент
+
+Внутренние типы приложения (props, local state, UI config) описываются обычными TypeScript-интерфейсами. Zod для них не используется.
+
+---
+
+## 2. Правила именования
+
+### 2.1 Шаблон схемы
+
+```
+[SliceName][Entity]Schema
+```
+
+- `SliceName` — имя FSD-слайса в PascalCase (`Auth`, `Operation`, `Order`). Всегда первым — обеспечивает группировку в автодополнении
+- `Entity` — что именно валидирует схема: токен, запрос, ответ, фильтры, состояние
+- `Schema`-суффикс обязателен — исключает коллизию с одноимённым типом
+- Если схема валидирует саму корневую сущность слайса — `Entity` опускается
+
+> **SliceName-префикс обязателен там, где имя без него теряет уникальность или плохо читается вне локального контекста файла.** В хорошо изолированном модуле с единственной схемой — `LoginRequestSchema` внутри `features/auth/login/model/` читается не хуже, чем `AuthLoginRequestSchema`. Префикс решает проблему уникальности, а не является самоцелью.
+
+```ts
+OperationSchema // корневая сущность слайса
+OperationListSchema // список операций
+OperationFiltersSchema // параметры фильтрации
+OperationCreateRequestSchema // тело запроса на создание
+
+AuthTokenSchema // токен ответа API
+AuthStateSchema // состояние store
+AuthLoginRequestSchema // логин — единственный метод
+AuthPersonalCodeLoginRequestSchema // логин — когда методов несколько
+AuthGoogleLoginRequestSchema // Google OAuth логин
+AuthGoogleRedirectResponseSchema // ответ редиректа Google OAuth
+```
+
+### 2.2 Шаблон типа
+
+Тип называется так же, как схема, но без суффикса `Schema`. Объявляется **сразу под схемой** в том же файле.
+
+```ts
+export const AuthTokenSchema = z.object({ ... })
+export type AuthToken = z.infer<typeof AuthTokenSchema>
+```
+
+### 2.3 Типы при наличии `.transform()`
+
+Если схема трансформирует ключи — появляются два типа с разными суффиксами:
+
+| Хук        | Суффикс      | Что описывает                              |
+| :--------- | :----------- | :----------------------------------------- |
+| `z.input`  | без суффикса | то, с чем работает приложение (camelCase)  |
+| `z.output` | `+ Payload`  | то, что уходит во внешний API (snake_case) |
+
+```ts
+export const AuthPersonalCodeLoginRequestSchema = z
+    .object({ personalCode: z.string() })
+    .transform(data => ({ personal_code: data.personalCode }))
+
+export type AuthPersonalCodeLoginRequest = z.input<typeof AuthPersonalCodeLoginRequestSchema>
+export type AuthPersonalCodeLoginRequestPayload = z.output<
+    typeof AuthPersonalCodeLoginRequestSchema
+>
+```
+
+### 2.4 Схемы-обёртки
+
+Если схема является обёрткой над другой (например, `SuccessApiResponseSchema`) — суффикс `Response` явно описывает этот факт. При этом важно разграничение:
+
+- `AuthLoginResponse` — весь распарсенный envelope ответа API
+- `AuthToken` — полезная доменная модель внутри `data`
+
+```ts
+export const AuthTokenSchema = z.object({ ... }).transform(...)
+export type AuthToken = z.infer<typeof AuthTokenSchema>
+
+export const AuthLoginResponseSchema = SuccessApiResponseSchema(AuthTokenSchema)
+export type AuthLoginResponse = z.infer<typeof AuthLoginResponseSchema>
+```
+
+### 2.5 Словарь допустимых Entity-суффиксов
+
+| Суффикс                           | Когда использовать                               |
+| :-------------------------------- | :----------------------------------------------- |
+| _(без суффикса)_                  | Корневая сущность слайса                         |
+| `List`                            | Массив сущностей                                 |
+| `LoginRequest`                    | Тело запроса — единственный метод логина         |
+| `PersonalCodeLoginRequest`        | Тело запроса — один из нескольких методов логина |
+| `CreateRequest` / `UpdateRequest` | Тело запроса по действию                         |
+| `Response`                        | Ответ API (envelope-обёртка)                     |
+| `RedirectResponse`                | Ответ с URL редиректа (например, OAuth)          |
+| `Filters`                         | Параметры фильтрации                             |
+| `State`                           | Состояние store                                  |
+| `Payload`                         | Только для `z.output` при transform              |
+
+### 2.7 Файлы типов (.types.ts) и Zod
+
+Типы, полученные через `z.infer`, `z.input` или `z.output`, **не должны** объявляться или реэкспортироваться в файлах с суффиксом `.types.ts`. Они хранятся **только в файле схемы** (`.schema.ts`), сразу под соответствующей схемой.
+
+- **Правильно:** тип объявлен в `operation.schema.ts` рядом с `OperationSchema`, импорт типа — из этого же файла или из публичного API слайса (index), который реэкспортирует из schema.
+- **Неправильно:** в `operation.types.ts` объявлен `export type Operation = z.infer<typeof OperationSchema>` или реэкспорт типа из schema.
+
+Файл `.types.ts` предназначен только для типов, **не являющихся производными от Zod** (интерфейсы, type-алиасы над примитивами, ручные типы для props/state).
+
+### 2.8 Антипаттерны именования
+
+```ts
+AuthToken // ❌ нет Schema-суффикса — коллизия с типом
+LoginAuthRequestSchema // ❌ SliceName не первым
+AuthResponseParsed // ❌ Parsed избыточен — z.infer всегда даёт распарсенный тип
+AuthLoginApiDto // ❌ Dto — бэкендовый термин, чужеродный для FSD
+GoogleRedirectResponseSchema // ❌ нет SliceName-префикса
+AuthLoginRequestSchemaType // ❌ двойной суффикс
+OperationOperationSchema // ❌ дублирование когда Entity === SliceName
+```
+
+---
+
+## 3. Эталонные реализации
+
+### 3.1. Парсинг ответа API (snake_case → camelCase)
+
+```typescript
+import { z } from 'zod'
+
+/**
+ * Схема валидации операции для GET /api/operations/:id.
+ * @description Вход: snake_case от API, выход: camelCase (transform).
+ */
+export const OperationSchema = z
+    .object({
+        total_price: z.coerce.number(),
+        bonus_paid_amount: z.coerce.number(),
+        real_paid_amount: z.coerce.number(),
+        status: z.string().optional(),
+    })
+    .transform(data => ({
+        totalPrice: data.total_price,
+        bonusPaidAmount: data.bonus_paid_amount,
+        realPaidAmount: data.real_paid_amount,
+        status: data.status,
+    }))
+
+export type Operation = z.infer<typeof OperationSchema>
+```
+
+**Использование в TanStack Query:**
+
+```typescript
+const rawData = await api.get('/operations/1')
+return OperationSchema.parse(rawData) // возвращает Operation
+```
+
+### 3.2. Подготовка тела запроса (camelCase → snake_case)
+
+```typescript
+import { z } from 'zod'
+
+/**
+ * Схема валидации тела запроса обновления операции для PATCH /api/operations/:id.
+ * @description Вход: camelCase от UI, выход: snake_case для API (transform).
+ */
+export const OperationUpdateRequestSchema = z
+    .object({
+        operationId: z.string().uuid(),
+        bonusPaidAmount: z.number().min(0, 'Сумма не может быть отрицательной'),
+    })
+    .transform(data => ({
+        operation_id: data.operationId,
+        bonus_paid_amount: data.bonusPaidAmount,
+    }))
+
+export type OperationUpdateRequest = z.input<typeof OperationUpdateRequestSchema>
+export type OperationUpdateRequestPayload = z.output<typeof OperationUpdateRequestSchema>
+```
+
+**Использование перед Axios-мутацией:**
+
+```typescript
+export const updateOperation = (payload: OperationUpdateRequest): Promise<unknown> => {
+    const apiPayload = OperationUpdateRequestSchema.parse(payload)
+    return api.patch(`/operations/${apiPayload.operation_id}`, apiPayload)
+}
+```
+
+---
+
+## 4. Best Practices и ограничения
+
+- **Никакого humps**: Глобальные библиотеки маппинга ключей запрещены. Все преобразования делаются явно в `.transform()`
+- **Никаких `as Type`**: Использование Type Assertion запрещено. Если тип теряется — схема написана неверно
+- **z.coerce для нестрогих источников**: Использовать `z.coerce.number()`, `z.coerce.boolean()`, `z.coerce.date()` там, где источник данных по природе нестабилен. Для строгих backend-контрактов предпочитать обычный `z.number()` — coercion может скрыть деградацию контракта
+- **`.nullish()` для опциональных полей**: Для полей, которые API может прислать как `null` или `undefined`, использовать `.nullish()` вместо дублирования `.nullable().optional()`
+- **`.catch()` — только как осознанное исключение**: Фоллбэк через `.catch()` допустим исключительно для некритичных опциональных полей с явным обоснованием. Для контрактных полей — fail-fast. Тихий фоллбэк скрывает деградацию API и серверные баги
+- **z.infer рядом со схемой**: Типы из `z.infer` / `z.input` / `z.output` объявляются только в файле схемы (см. §2.7). В файлах `.types.ts` их не реэкспортировать.

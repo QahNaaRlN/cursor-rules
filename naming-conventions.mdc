@@ -1,0 +1,158 @@
+---
+description: 'Naming Standard: Strict FSD semantic hybrid. Enforces kebab-case for suffixes and matching between filenames and exports.'
+alwaysApply: true
+---
+
+# 🏗 Конвенции именования (hFSD & Monorepo)
+
+Вы — архитектор CBS. Ваша цель — абсолютная консистентность. Любое отклонение от этих правил — это технический долг, который должен быть исправлен немедленно.
+
+## 1. Справочник стандартов (Strict Mode)
+
+| Объект                 | Стиль файла             | Правило именования                   | Примеры                               |
+| :--------------------- | :---------------------- | :----------------------------------- | :------------------------------------ |
+| **Папки**              | `kebab-case`            | Всегда строчный регистр              | `features/client-edit`                |
+| **Компоненты**         | `PascalCase.vue`        | Совпадает с именем в коде            | `ClientModal.vue`                     |
+| **Хуки**               | `camelCase.ts`          | Совпадает с именем функции           | `useClientForm.ts`                    |
+| **FSD Сегменты**       | `kebab.[kebab-type].ts` | Имя и тип в kebab-case               | `auth.query-keys.ts`, `client.api.ts` |
+| **Схемы (Zod)**        | `kebab.schema.ts`       | Всегда через `.schema.`              | `client-edit.schema.ts`               |
+| **Утилиты (действие)** | `kebab-case.ts`         | Глагольная фраза — суффикс не нужен  | `fill-steps-from-transitions.ts`      |
+| **Утилиты (сущность)** | `kebab.[kebab-type].ts` | Существительное — суффикс обязателен | `date-format.util.ts`                 |
+
+## 2. Ключевые архитектурные правила
+
+### 🔗 Смысловое соответствие (Named Exports)
+
+Имя файла должно 1-к-1 отражать основную сущность, которую он экспортирует.
+
+- **Хуки**: `useClient.ts` -> `export const useClient`.
+- **Сегменты**: `auth.api.ts` -> `export const authApi`.
+- **Ключи**: `auth.query-keys.ts` -> `export const authQueryKeys`.
+- **Сторы**: `auth.store.ts` -> `export const useAuthStore` (исключение для Pinia).
+
+### 🧩 Строгий Kebab для суффиксов
+
+Суффикс (тип сегмента) после точки ОБЯЗАН быть в `kebab-case`.
+
+- **❌ Ошибка**: `auth.queryKeys.ts`, `client.editSchema.ts`.
+- **✅ Правильно**: `auth.query-keys.ts`, `client.edit-schema.ts`.
+
+Это критично для корректного поиска в Cursor и работы в Linux-окружении (WSL/Docker).
+
+### 📦 Словарь суффиксов (закрытый список)
+
+Суффикс выбирается строго из этого списка. Новый суффикс — только после обновления правила.
+
+| Суффикс              | Назначение                                                                                                              | Пример                        |
+| :------------------- | :---------------------------------------------------------------------------------------------------------------------- | :---------------------------- |
+| `.api.ts`            | Функции запросов к API                                                                                                  | `operation.api.ts`            |
+| `.query-keys.ts`     | Ключи для TanStack Query                                                                                                | `operation.query-keys.ts`     |
+| `.mutations-keys.ts` | Ключи мутаций для TanStack Query                                                                                        | `operation.mutations-keys.ts` |
+| `.schema.ts`         | Zod-схема валидации                                                                                                     | `operation.schema.ts`         |
+| `.store.ts`          | Pinia store                                                                                                             | `operation-flow.store.ts`     |
+| `.types.ts`          | Только TypeScript-типы и интерфейсы, **не** производные от Zod (`z.infer`/`z.input`/`z.output` хранятся в `.schema.ts`) | `operation.types.ts`          |
+| `.handler.ts`        | Обработчики событий / action-хэндлеры                                                                                   | `operation-action.handler.ts` |
+| `.strategy.ts`       | Реализация паттерна стратегий                                                                                           | `flow-completion.strategy.ts` |
+| `.const.ts`          | Константы модуля                                                                                                        | `operation-status.const.ts`   |
+| `.util.ts`           | Утилита-существительное                                                                                                 | `date-format.util.ts`         |
+
+В файлах `.types.ts` запрещено реэкспортировать или объявлять типы, полученные через Zod (`z.infer`, `z.input`, `z.output`); такие типы хранятся только в `.schema.ts` (см. правило Zod §2.7).
+
+**Критерий выбора суффикса**: если имя файла — **глагол или глагольная фраза** (`fill-steps-from-transitions`) — суффикс не нужен. Если **существительное** (`operation-action-handlers`) — суффикс из таблицы обязателен.
+
+---
+
+## 3. Эталонная карта feature-слайса
+
+Полная таблица «файл → экспорт» для одного слайса. Применяется к любой фиче в `packages/features/` и `apps/*/src/features/`. Пример: `search-order`.
+
+### Структура папки
+
+```
+features/search-order/
+  api/
+    search-order.api.ts
+    search-order.query-keys.ts
+    search-order.mutations-keys.ts
+    useSearchOrdersQuery.ts        ← хук GET, один файл — один хук
+    useSearchOrder.ts              ← сценарный хук (если есть оркестрация)
+  model/
+    search-order.schema.ts         ← Zod-схемы + z.infer типы
+    search-order.store.ts          ← Pinia (только UI-state)
+    search-order.types.ts          ← только ручные TS-типы, не z.infer
+  ui/
+    SearchOrderForm.vue
+    SearchOrderResults.vue
+  index.ts
+```
+
+### Таблица: файл → экспорт
+
+| Файл                             | Экспорт                                               | Правило                      |
+| :------------------------------- | :---------------------------------------------------- | :--------------------------- |
+| `search-order.schema.ts`         | `SearchOrderFiltersSchema`, `SearchOrderResultSchema` | `[SliceName][Entity]Schema`  |
+| `search-order.types.ts`          | `SearchOrderState` (ручные интерфейсы)                | Нет `z.infer`                |
+| `search-order.store.ts`          | `useSearchOrderStore`                                 | `use[Domain]Store`           |
+| `search-order.api.ts`            | `searchOrderApi`                                      | `[sliceName]Api`             |
+| `search-order.query-keys.ts`     | `searchOrderQueryKeys`                                | `[sliceName]QueryKeys`       |
+| `search-order.mutations-keys.ts` | `searchOrderMutations`                                | `[sliceName]Mutations`       |
+| `useSearchOrdersQuery.ts`        | `useSearchOrdersQuery`                                | `use[Action][Entity]Query`   |
+| `useSearchOrder.ts`              | `useSearchOrder`                                      | без суффикса — сценарный хук |
+| `SearchOrderForm.vue`            | default export                                        | `PascalCase.vue`             |
+
+### Правила именования экспортов
+
+- **Схемы**: `SearchOrder[Entity]Schema` — SliceName в PascalCase всегда первым (`SearchOrder`, не `Order`).
+- **Типы из Zod**: объявляются в `.schema.ts` рядом со схемой, реэкспортируются через `index.ts` в блоке `types`.
+- **Ручные типы**: в `.types.ts` — только интерфейсы и type-алиасы, не связанные с Zod.
+- **Сценарный хук**: если хук инкапсулирует полный сценарий с оркестрацией — суффикс `Mutation`/`Query` опускается (`useSearchOrder`, не `useSearchOrderMutation`).
+- **Mutation keys**: суффикс файла `.mutations-keys.ts` (не `.mutation-keys.ts`) — `mutations` во множественном числе.
+
+### Эталонный index.ts
+
+```ts
+/** Публичный API фичи search-order. */
+
+// api
+export { searchOrderApi } from './api/search-order.api'
+export { searchOrderQueryKeys } from './api/search-order.query-keys'
+export { searchOrderMutations } from './api/search-order.mutations-keys'
+export { useSearchOrdersQuery } from './api/useSearchOrdersQuery'
+export { useSearchOrder } from './api/useSearchOrder'
+
+// model
+export { SearchOrderFiltersSchema, SearchOrderResultSchema } from './model/search-order.schema'
+export { useSearchOrderStore } from './model/search-order.store'
+
+// ui
+export { default as SearchOrderForm } from './ui/SearchOrderForm.vue'
+export { default as SearchOrderResults } from './ui/SearchOrderResults.vue'
+
+// types
+export type {
+  SearchOrderFilters,
+  SearchOrderFiltersPayload,
+  SearchOrderResult,
+  SearchOrderState,
+} from './model/search-order.types'
+```
+
+> Zod-производные типы (`SearchOrderFilters`, `SearchOrderFiltersPayload`, `SearchOrderResult`) физически живут в `.schema.ts`, но реэкспортируются через `index.ts` в блоке `types` — это соответствует §2.7 стандарта Zod и §2 стандарта index.
+
+---
+
+## 4. Протокол проверки "Сначала Имена — Потом Код"
+
+### 🔍 Шаг 1: Обязательный аудит перед работой
+
+Перед выполнением любой задачи необходимо просканировать пути файлов. При обнаружении нарушения (например, `authApi.ts` или `auth.queryKeys.ts`) — **необходимо немедленно прекратить работу**.
+
+### 🛠 Шаг 2: Принудительный рефакторинг
+
+1. Необходимо сообщить пользователю: _"Найдено нарушение: [old]. Согласно Final Edition, переименовываю в [new] и исправляю экспорт"_.
+2. Необходимо переименовать файл.
+3. **Необходимо автоматически обновить все импорты** по всему проекту.
+
+### ✨ Шаг 3: Написание нового
+
+При создании нового кода необходимо автоматически применять правила из таблицы. Если в промпте пользователя указано некорректное имя — необходимо молча исправить его на эталонное.

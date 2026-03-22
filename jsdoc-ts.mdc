@@ -1,0 +1,78 @@
+---
+description: 'JSDoc для TypeScript: функции, утилиты, Zod-схемы'
+globs:
+  - 'apps/**/src/**/*.ts'
+---
+
+# 📝 JSDoc TypeScript Standard
+
+Расширяет `jsdoc-core`. Применяется ко всем `.ts` файлам.
+
+## Требования
+
+- `@throws` — **обязателен** для функций, работающих с API или валидацией Zod.
+
+- `@example` — **обязателен** для функций в слоях `shared` и `entities`.
+
+- **Связь с Zod**: при описании схем указывай API-метод или сущность, для которой предназначена схема.
+
+## Запрет типов в фигурных скобках
+
+**Запрещено** указывать типы в `{...}` в тегах `@param` и `@returns`. TypeScript-сигнатура уже несёт полную информацию о типах — дублировать её в JSDoc значит создавать второй источник истины, который расходится при рефакторинге.
+
+```typescript
+// ❌ Типы в фигурных скобках — дублируют сигнатуру, устаревают при рефакторинге
+/**
+ * @param {LoginRequest} payload - Данные для входа.
+ * @returns {Promise<AuthToken>} JWT-токен сессии.
+ * @throws {ZodError} При невалидном формате payload.
+ */
+
+// ✅ Только имя параметра и описание
+/**
+ * @param payload - Данные для входа (camelCase).
+ * @returns JWT-токен сессии.
+ * @throws {ZodError} При невалидном формате payload.
+ */
+```
+
+> **Исключение:** `@throws` допускает тип в фигурных скобках — это устоявшаяся конвенция JSDoc для обозначения класса ошибки, не дублирующая сигнатуру.
+
+## Правило @example
+
+`@example` показывает **как используется функция** — без лишних импортов и объявлений, которые не относятся к сути вызова.
+
+```typescript
+// ❌ Лишние импорты и объявление схемы в примере
+* @example
+* import { z } from 'zod'
+* import { parseZodError } from '@cbs/shared'
+* const MySchema = z.object({ query: z.string() })
+* const result = MySchema.safeParse({ query: '' })
+* if (!result.success) {
+*   const message = parseZodError('MySchema', result.error)
+* }
+
+// ✅ Только вызов и контекст использования
+* @example
+* const result = MySchema.safeParse({ query: '' })
+* if (!result.success) {
+*   console.error(parseZodError('MySchema', result.error))
+* }
+```
+
+## Эталонный пример
+
+```typescript
+/**
+ * Функция, которая авторизует сотрудника по табельному коду.
+ * @description При успехе сохраняет токен в auth store и перенаправляет на главную.
+ * @param payload - Данные для входа (camelCase).
+ * @returns JWT-токен сессии.
+ * @throws {ZodError} При невалидном формате payload.
+ * @throws {ApiError} При ошибке сервера (4xx/5xx).
+ * @example
+ * const token = await login({ employeeCode: '0042' })
+ */
+export const login = async (payload: LoginRequest): Promise<AuthToken> => { ... }
+```
